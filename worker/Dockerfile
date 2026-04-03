@@ -49,17 +49,15 @@ RUN R -e "install.packages(c('rstan', 'rstantools', 'StanHeaders', 'loo', 'R6', 
 # Additional R deps for the worker script
 RUN R -e "install.packages(c('RPostgres', 'DBI', 'dplyr', 'ggplot2', 'plotly', 'jsonlite'), repos='https://cloud.r-project.org/')"
 
-# ── Install stanassay from GitHub ────────────────────────────────────────────
-# stanassay is a private repo (immunoplex/stanassay).
-# Uses Docker BuildKit secrets to pass GITHUB_PAT securely (not baked into layer).
+# ── Install stanassay from source tarball ────────────────────────────────────
+# stanassay tarball is committed to the repo (built from immunoplex/stanassay).
 # Stan C++ → .so compilation happens here at build time (~5-10 min, cached).
 #
-# For local dev with tarball instead:
-#   COPY stanassay_*.tar.gz /tmp/
-#   RUN R CMD INSTALL /tmp/stanassay_*.tar.gz && rm /tmp/stanassay_*.tar.gz
-RUN --mount=type=secret,id=github_pat \
-    export GITHUB_PAT=$(cat /run/secrets/github_pat 2>/dev/null || echo "") && \
-    R -e "remotes::install_github('immunoplex/stanassay', upgrade='never', quiet=FALSE)"
+# To rebuild the tarball when stanassay changes:
+#   cd ../stanassay && R CMD build . --no-manual --no-vignettes
+#   cp stanassay_*.tar.gz ../immunoplex-batch-calculator/worker/
+COPY stanassay_*.tar.gz /tmp/
+RUN R CMD INSTALL /tmp/stanassay_*.tar.gz && rm /tmp/stanassay_*.tar.gz
 
 # ── Copy worker scripts ─────────────────────────────────────────────────────
 
