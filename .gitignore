@@ -14,11 +14,7 @@ venv/
 # Docker
 .env
 
-# stanassay tarball is committed to repo for CI builds.
-# To update: cd ../stanassay && R CMD build . --no-manual && cp stanassay_*.tar.gz ../immunoplex-batch-calculator/worker/
-
 # Output
-batch_output/
 plots/
 *.zip
 *.html
