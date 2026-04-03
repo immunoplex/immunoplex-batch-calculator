@@ -214,6 +214,7 @@ app = FastAPI(
         "**Authentication**: Pass `X-API-Key` header on all requests (except `/health`)."
     ),
     version="0.2.0",
+    root_path=os.getenv("ROOT_PATH", ""),
 )
 
 app.add_middleware(
