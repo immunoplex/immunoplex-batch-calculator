@@ -287,27 +287,57 @@ message(sprintf("Worker starting: study=%s experiment=%s scope=%s job_id=%s proj
 #   - On large machines (32+ cores): 4 chains, many threads each via reduce_sum
 #   - Always leave 2 cores free for supervisor + OS
 
-AVAILABLE_CORES <- max(1L, parallel::detectCores(logical = FALSE))
-if (is.na(AVAILABLE_CORES)) AVAILABLE_CORES <- max(1L, parallel::detectCores())
-if (is.na(AVAILABLE_CORES)) AVAILABLE_CORES <- 4L  # safe fallback
+# Detect available cores — respect K8s/cgroup CPU limits, not just host cores.
+# In containers, detectCores() often returns the HOST core count (e.g. 80)
+# but the pod may be limited to 8 via K8s resource limits.
+# The cgroup CPU quota is the authoritative limit.
+detect_effective_cores <- function() {
+  # Try cgroup v2 (modern K8s)
+  quota <- tryCatch(
+    as.numeric(readLines("/sys/fs/cgroup/cpu.max", warn = FALSE)[1]),
+    error = function(e) NA)
+  if (!is.na(quota) && quota > 0) {
+    period <- tryCatch({
+      parts <- strsplit(readLines("/sys/fs/cgroup/cpu.max", warn = FALSE), " ")[[1]]
+      as.numeric(parts[2])
+    }, error = function(e) 100000)
+    return(max(1L, as.integer(floor(quota / period))))
+  }
+  # Try cgroup v1 (older K8s)
+  quota_v1 <- tryCatch(
+    as.numeric(readLines("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", warn = FALSE)),
+    error = function(e) -1)
+  if (quota_v1 > 0) {
+    period_v1 <- tryCatch(
+      as.numeric(readLines("/sys/fs/cgroup/cpu/cpu.cfs_period_us", warn = FALSE)),
+      error = function(e) 100000)
+    return(max(1L, as.integer(floor(quota_v1 / period_v1))))
+  }
+  # Fallback: nproc (respects cgroup on modern kernels) or detectCores
+  nproc <- tryCatch(as.integer(system("nproc", intern = TRUE)), error = function(e) NA)
+  if (!is.na(nproc) && nproc > 0) return(nproc)
+  cores <- parallel::detectCores(logical = FALSE)
+  if (is.na(cores)) cores <- parallel::detectCores()
+  if (is.na(cores)) cores <- 4L
+  cores
+}
+
+AVAILABLE_CORES <- detect_effective_cores()
 
 N_CHAINS <- 4L
 N_ITER   <- 1000L
 FAMILIES <- c("4pl", "5pl", "gompertz")
 
-# Reserve 2 cores for supervisor + OS (minimum 2 usable)
-USABLE_CORES <- max(2L, AVAILABLE_CORES - 2L)
+# Reserve 1 core for supervisor (minimum 2 usable)
+USABLE_CORES <- max(2L, AVAILABLE_CORES - 1L)
 
 # Chains that can run in parallel (capped at N_CHAINS)
 CORES_FOR_CHAINS <- min(N_CHAINS, USABLE_CORES)
 
-# Remaining cores go to within-chain threading
+# Within-chain threading via reduce_sum.
+# Sweet spot: 1-4 threads per chain for typical immunoassay data (100-500 obs).
+# Beyond ~4, TBB overhead can dominate for small datasets.
 THREADS_PER_CHAIN <- max(1L, floor(USABLE_CORES / CORES_FOR_CHAINS))
-
-# Safety: total must not exceed what's available
-if (CORES_FOR_CHAINS * THREADS_PER_CHAIN > AVAILABLE_CORES) {
-  THREADS_PER_CHAIN <- max(1L, floor(AVAILABLE_CORES / CORES_FOR_CHAINS))
-}
 
 # Set environment
 Sys.setenv(STAN_NUM_THREADS = as.character(THREADS_PER_CHAIN))
