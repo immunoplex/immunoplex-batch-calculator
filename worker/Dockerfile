@@ -51,17 +51,15 @@ RUN R -e "install.packages(c('RPostgres', 'DBI', 'dplyr', 'ggplot2', 'plotly', '
 
 # ── Install stanassay from GitHub ────────────────────────────────────────────
 # stanassay is a private repo (immunoplex/stanassay).
-# GITHUB_PAT is passed as a build secret for CI, or set in environment for local.
+# Uses Docker BuildKit secrets to pass GITHUB_PAT securely (not baked into layer).
 # Stan C++ → .so compilation happens here at build time (~5-10 min, cached).
 #
 # For local dev with tarball instead:
 #   COPY stanassay_*.tar.gz /tmp/
 #   RUN R CMD INSTALL /tmp/stanassay_*.tar.gz && rm /tmp/stanassay_*.tar.gz
-ARG GITHUB_PAT=""
-RUN R -e "\
-  pat <- Sys.getenv('GITHUB_PAT', unset='${GITHUB_PAT}'); \
-  if (nzchar(pat)) Sys.setenv(GITHUB_PAT=pat); \
-  devtools::install_github('immunoplex/stanassay', upgrade='never', quiet=FALSE)"
+RUN --mount=type=secret,id=github_pat \
+    export GITHUB_PAT=$(cat /run/secrets/github_pat 2>/dev/null || echo "") && \
+    R -e "remotes::install_github('immunoplex/stanassay', upgrade='never', quiet=FALSE)"
 
 # ── Copy worker scripts ─────────────────────────────────────────────────────
 
@@ -73,15 +71,14 @@ RUN chmod +x entrypoint.sh
 
 # ── Environment defaults ─────────────────────────────────────────────────────
 
+# Runtime defaults — credentials are set via K8s secrets / docker-compose env
 ENV REDIS_HOST=redis \
     REDIS_PORT=6379 \
-    REDIS_AUTH="" \
     REDIS_DB=0 \
     DB_NAME=local_madi_ispi \
     DB_HOST=localhost \
     DB_PORT=5432 \
-    DB_USER=hardik \
-    DB_PASSWORD="" \
+    DB_USER=postgres \
     DB_SSLMODE=disable \
     OUTPUT_DIR=/data/bayes \
     PROGRESS_DIR=/tmp

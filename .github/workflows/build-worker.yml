@@ -56,9 +56,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # Worker is amd64-only (Stan compilation on arm64 is unreliable)
           platforms: linux/amd64
-          # Pass GitHub token for private stanassay repo access
-          build-args: |
-            GITHUB_PAT=${{ secrets.STANASSAY_PAT }}
+          # Pass GitHub PAT as BuildKit secret for private stanassay repo
+          secrets: |
+            github_pat=${{ secrets.STANASSAY_PAT }}
           # Cache R package installs + Stan compilation across builds
           cache-from: type=gha
           cache-to: type=gha,mode=max
