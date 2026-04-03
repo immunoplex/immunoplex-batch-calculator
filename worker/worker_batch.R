@@ -269,50 +269,59 @@ message(sprintf("Worker starting: study=%s experiment=%s scope=%s job_id=%s proj
 
 
 # ─── Threading ───────────────────────────────────────────────────────────────
-# Strategy: throw all available cores at ONE combo at a time.
-# Since we process combos sequentially (for progress + DB saves), there's no
-# benefit to reserving cores for parallel antigens.
+# Machine-agnostic auto-scaling: works from 2 cores to 80+ cores.
 #
 # Stan has two levels of parallelism:
-#   1. Between-chain: rstan runs N_CHAINS chains on `cores` processes
-#   2. Within-chain: reduce_sum splits the likelihood across STAN_NUM_THREADS
-#      (requires models compiled with reduce_sum — stanassay's models have this)
+#   1. Between-chain: rstan runs N_CHAINS chains on `cores` CPU processes
+#   2. Within-chain:  reduce_sum splits likelihood across STAN_NUM_THREADS
+#      (stanassay models are compiled with reduce_sum for this)
 #
-# Total CPU = cores × threads_per_chain (capped at available physical cores)
+# Strategy: throw all available cores at one combo at a time.
+# We process combos sequentially (for per-combo DB saves + progress).
 #
-# For 80-core machine: 4 chains × 16 threads/chain = 64 cores (leaves 16 for OS)
-# For 8-core machine:  4 chains × 1 thread/chain = 4 cores (conservative)
-# For 4-core machine:  4 chains × 1 thread/chain = 4 cores (minimum)
+# Auto-scaling rules:
+#   - Always want 4 chains (minimum for convergence diagnostics / Rhat)
+#   - On small machines (<=6 cores): 4 chains, 1 thread each, run chains
+#     sequentially if needed (rstan handles this — chains=4, cores=min(4, avail))
+#   - On medium machines (8-16 cores): 4 chains in parallel, 1-3 threads each
+#   - On large machines (32+ cores): 4 chains, many threads each via reduce_sum
+#   - Always leave 2 cores free for supervisor + OS
 
 AVAILABLE_CORES <- max(1L, parallel::detectCores(logical = FALSE))
-N_CHAINS        <- 4L
-N_ITER          <- 1000L
-FAMILIES        <- c("4pl", "5pl", "gompertz")
+if (is.na(AVAILABLE_CORES)) AVAILABLE_CORES <- max(1L, parallel::detectCores())
+if (is.na(AVAILABLE_CORES)) AVAILABLE_CORES <- 4L  # safe fallback
 
-# Compute threads_per_chain: use all available cores divided among chains,
-# leaving a few cores free for supervisor + OS
-usable_cores <- max(N_CHAINS, AVAILABLE_CORES - 2L)
-THREADS_PER_CHAIN <- max(1L, floor(usable_cores / N_CHAINS))
+N_CHAINS <- 4L
+N_ITER   <- 1000L
+FAMILIES <- c("4pl", "5pl", "gompertz")
 
-# Cap total threads to not exceed available
-total_threads <- N_CHAINS * THREADS_PER_CHAIN
-if (total_threads > AVAILABLE_CORES) {
-  THREADS_PER_CHAIN <- max(1L, floor(AVAILABLE_CORES / N_CHAINS))
+# Reserve 2 cores for supervisor + OS (minimum 2 usable)
+USABLE_CORES <- max(2L, AVAILABLE_CORES - 2L)
+
+# Chains that can run in parallel (capped at N_CHAINS)
+CORES_FOR_CHAINS <- min(N_CHAINS, USABLE_CORES)
+
+# Remaining cores go to within-chain threading
+THREADS_PER_CHAIN <- max(1L, floor(USABLE_CORES / CORES_FOR_CHAINS))
+
+# Safety: total must not exceed what's available
+if (CORES_FOR_CHAINS * THREADS_PER_CHAIN > AVAILABLE_CORES) {
+  THREADS_PER_CHAIN <- max(1L, floor(AVAILABLE_CORES / CORES_FOR_CHAINS))
 }
 
-# Set environment for Stan threading
+# Set environment
 Sys.setenv(STAN_NUM_THREADS = as.character(THREADS_PER_CHAIN))
-Sys.setenv(MC_CORES = as.character(N_CHAINS))
+Sys.setenv(MC_CORES = as.character(CORES_FOR_CHAINS))
 # Keep BLAS/LAPACK single-threaded to avoid oversubscription with Stan threads
 Sys.setenv(OMP_NUM_THREADS = "1")
 Sys.setenv(OPENBLAS_NUM_THREADS = "1")
 Sys.setenv(MKL_NUM_THREADS = "1")
 Sys.setenv(BLIS_NUM_THREADS = "1")
-options(mc.cores = N_CHAINS, warn = 1)
+options(mc.cores = CORES_FOR_CHAINS, warn = 1)
 
-message(sprintf("Threading: %d physical cores, %d chains x %d threads/chain = %d total",
-                AVAILABLE_CORES, N_CHAINS, THREADS_PER_CHAIN,
-                N_CHAINS * THREADS_PER_CHAIN))
+message(sprintf("Threading: %d physical cores, %d usable, %d chains (cores=%d) x %d threads/chain = %d total",
+                AVAILABLE_CORES, USABLE_CORES, N_CHAINS, CORES_FOR_CHAINS,
+                THREADS_PER_CHAIN, CORES_FOR_CHAINS * THREADS_PER_CHAIN))
 
 
 # ─── Progress Reporting ──────────────────────────────────────────────────────
@@ -662,7 +671,7 @@ fit_one <- function(conn, study, experiment, antigen,
     )
     suppressWarnings(a$fit_ensemble(
       families = FAMILIES, error_model = "exact", n_iter = N_ITER,
-      n_chains = N_CHAINS, cores = N_CHAINS,
+      n_chains = N_CHAINS, cores = CORES_FOR_CHAINS,
       threads_per_chain = THREADS_PER_CHAIN, grainsize = 1L, refresh = 0L
     ))
     a
