@@ -265,12 +265,10 @@ def run_job(r: redis.Redis, job_id: str, job_data: dict):
 
     # ── Environment ───────────────────────────────────────────────────────
     env = os.environ.copy()
-    # Threading config (relevant for Stan/BLAS, harmless for others)
-    env["STAN_NUM_THREADS"] = "1"
-    env["OMP_NUM_THREADS"] = "1"
-    env["OPENBLAS_NUM_THREADS"] = "1"
-    env["MKL_NUM_THREADS"] = "1"
-    env["BLIS_NUM_THREADS"] = "1"
+    # Threading is configured by the R script (worker_batch.R) at startup.
+    # It auto-detects available cores via cgroup and sets STAN_NUM_THREADS,
+    # OMP_NUM_THREADS, etc. appropriately. Do NOT override them here —
+    # the R process needs to control its own threading.
 
     logger.info("Spawning: %s", " ".join(cmd))
 
