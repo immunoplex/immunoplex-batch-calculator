@@ -134,30 +134,256 @@
 # └─────────────────────────────────────────────────────────────────────────────┘
 #
 # ┌─────────────────────────────────────────────────────────────────────────────┐
-# │  DATABASE OUTPUT (5 tables in madi_results schema)                          │
+# │  DATABASE OUTPUT — 5 tables in madi_results schema                          │
 # │                                                                             │
-# │  bayes_curves      1 row per plate × source                                │
-# │    Curve params (a,b,c,d,g), LOQ at 15/20/custom%, LOD, LRDL, URDL,       │
-# │    inflection, ELPD, stacking weights. Parent table for FK.                │
+# │  How to trace a single standard curve:                                      │
+# │  ─────────────────────────────────────                                      │
+# │  Say you want the Bayesian fit for study "ALPHA", experiment "BETA",       │
+# │  antigen "gamma", plate "PLATE_01", source "NIBSC06_140".                  │
 # │                                                                             │
-# │  bayes_samples     1 row per sample well × dilution                        │
-# │    MFI, predicted concentration (median + 95% CI), SE, pCoV, gate_class.   │
-# │    FK → bayes_curves.                                                       │
+# │  1. bayes_curves: Look up by natural key                                   │
+# │     SELECT * FROM madi_results.bayes_curves                                │
+# │     WHERE study_accession='ALPHA' AND experiment_accession='BETA'          │
+# │       AND antigen='gamma' AND plateid='PLATE_01'                           │
+# │       AND source='NIBSC06_140';                                             │
+# │     → This gives you the curve params, LOQ values, and bayes_curves_id    │
 # │                                                                             │
-# │  bayes_ensemble    3 rows per plate (one per family: 4pl, 5pl, gompertz)   │
-# │    Per-family ELPD, stacking weight, parameter posteriors with 95% CIs.    │
-# │    FK → bayes_curves.                                                       │
+# │  2. bayes_samples: Get sample concentrations for that curve                │
+# │     SELECT * FROM madi_results.bayes_samples                               │
+# │     WHERE bayes_curves_id = <id from step 1>;                              │
+# │     → One row per sample well with predicted concentration + CI            │
 # │                                                                             │
-# │  bayes_curve_grid  100 rows per plate × source                             │
-# │    Pre-computed fitted curve + 95% CI ribbon for plot reconstruction.       │
-# │    FK → bayes_curves.                                                       │
+# │  3. bayes_ensemble: Compare the 3 model families for that plate            │
+# │     SELECT * FROM madi_results.bayes_ensemble                              │
+# │     WHERE plateid='PLATE_01' AND antigen='gamma';                          │
+# │     → 3 rows (4pl, 5pl, gompertz) with ELPD and parameter CIs             │
 # │                                                                             │
-# │  bayes_cdan_grid   200 rows per plate × source                             │
-# │    Pre-computed CDAN precision profile for plot reconstruction.             │
-# │    FK → bayes_curves.                                                       │
+# │  4. bayes_curve_grid: Reconstruct the fitted curve plot                    │
+# │     SELECT * FROM madi_results.bayes_curve_grid                            │
+# │     WHERE plateid='PLATE_01' AND antigen='gamma'                           │
+# │       AND source='NIBSC06_140' ORDER BY log10_conc;                        │
+# │     → 100 points: plot log10_conc (x) vs log10(mfi_median) (y)            │
+# │       mfi_lower_95 and mfi_upper_95 give the CI ribbon                    │
 # │                                                                             │
-# │  All writes use idempotent upsert (INSERT ... ON CONFLICT DO UPDATE)       │
-# │  or delete+insert (for grid tables). Re-running a job safely overwrites.   │
+# │  5. bayes_cdan_grid: Reconstruct the precision profile                     │
+# │     SELECT * FROM madi_results.bayes_cdan_grid                             │
+# │     WHERE plateid='PLATE_01' AND antigen='gamma'                           │
+# │       AND source='NIBSC06_140' ORDER BY log10_conc;                        │
+# │     → 200 points: smoothed_cv is the CDAN precision curve (right y-axis)  │
+# │                                                                             │
+# │  Why separate sources?                                                      │
+# │  ────────────────────                                                       │
+# │  Each source (e.g. NIBSC06_140, SD) has different standard concentrations. │
+# │  They are fitted INDEPENDENTLY — same plate, same antigen, but different   │
+# │  standard curves. So plateid+antigen+source uniquely identifies a fit.     │
+# │  The ensemble (model comparison) is per plateid+antigen (shared across     │
+# │  sources since the hierarchical model pools information).                   │
+# │                                                                             │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  TABLE 1: bayes_curves — The "master" table (1 row per plate × source)     │
+# │                                                                             │
+# │  Natural key: (project_id, study_accession, experiment_accession,          │
+# │    plateid, plate, nominal_sample_dilution, source, wavelength,            │
+# │    antigen, feature)                                                        │
+# │                                                                             │
+# │  What's stored:                                                             │
+# │                                                                             │
+# │  Curve parameters (posterior medians from the best-family fit):            │
+# │    a     — lower asymptote (MFI at zero concentration)                     │
+# │    b     — slope (Hill coefficient in log domain)                          │
+# │    c     — inflection point / EC50 (concentration units)                   │
+# │    d     — upper asymptote (MFI at infinite concentration)                 │
+# │    g     — asymmetry parameter (1.0 = symmetric 4PL, ≠1 = 5PL)           │
+# │    curve_family — which model won for this plate ("4pl", "5pl", "gompertz")│
+# │                                                                             │
+# │  The forward function (to evaluate MFI at any concentration x):            │
+# │    4PL/5PL: MFI = d + (a - d) / (1 + exp(b * (ln(x) - ln(c))))^g        │
+# │    Gompertz: MFI = d + (a - d) * exp(-exp(b * (ln(x) - ln(c))))          │
+# │                                                                             │
+# │  Limits of Quantification (LOQ) — from CDAN precision analysis:           │
+# │    lloq / uloq         — at 20% CV (standard threshold)                   │
+# │    lloq_15 / uloq_15   — at 15% CV (stricter threshold)                   │
+# │    lloq_custom / uloq_custom — at user-specified CV% (cdan_cv_threshold)   │
+# │    lloq_y / uloq_y     — MFI values at the LOQ concentrations             │
+# │                                                                             │
+# │    Why 3 LOQ values? Different applications need different precision.      │
+# │    Regulatory submissions often use 20%, research may want 15%,            │
+# │    and the custom threshold lets users explore what-if scenarios.           │
+# │    The LOQ is where the CDAN precision profile crosses the threshold —    │
+# │    LLOQ is the low-concentration crossing, ULOQ is the high one.          │
+# │    Between LLOQ and ULOQ is the "dynamic range" where the assay is        │
+# │    quantitatively reliable.                                                 │
+# │                                                                             │
+# │  Detection limits:                                                          │
+# │    lod / lod_y     — Bayesian Limit of Detection (3σ blank criterion)     │
+# │                       Lowest concentration distinguishable from blank.     │
+# │    lrdl            — Lower Reliable Detection Limit (posterior predictive) │
+# │    uod / uod_y     — Upper limit of detection                              │
+# │    urdl            — Upper Reliable Detection Limit                        │
+# │                                                                             │
+# │  Second-derivative shoulders:                                               │
+# │    lo2d / uo2d      — Concentrations where d²y/d(lnx)² = 0               │
+# │                       Marks where the curve transitions from flat to steep │
+# │    lo2d_y / uo2d_y  — MFI values at those points                          │
+# │                                                                             │
+# │  Inflection point (point of maximum sensitivity):                          │
+# │    inflect_x / inflect_y     — concentration and MFI at max |dy/dx|       │
+# │    inflect_x_lower / _upper  — 95% credible interval on concentration     │
+# │    dydx_inflect              — slope at the inflection point               │
+# │                                                                             │
+# │  Ensemble model comparison:                                                 │
+# │    plate_elpd_4pl / _5pl / _gompertz — per-plate LOO-ELPD for each family │
+# │    global_stacking_4pl / _5pl / _gompertz — global stacking weights        │
+# │    global_best_family / plate_best_family — which model won                │
+# │                                                                             │
+# │    ELPD = Expected Log Pointwise Predictive Density (higher = better fit). │
+# │    Stacking weights combine all 3 families into a weighted ensemble.       │
+# │    plate_best_family may differ from global_best_family — the global best  │
+# │    is used because it pools information across plates for robustness.       │
+# │                                                                             │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  TABLE 2: bayes_samples — Sample concentrations (1 row per well×dilution)  │
+# │                                                                             │
+# │  FK: bayes_curves_id → bayes_curves                                        │
+# │                                                                             │
+# │  For each sample MFI measurement, the Bayesian inverse function gives:     │
+# │    raw_predicted_concentration — posterior median concentration             │
+# │    conc_lower / conc_upper     — 2.5% / 97.5% credible interval           │
+# │    se_concentration            — posterior SD of concentration              │
+# │    pcov                        — predicted coefficient of variation         │
+# │                                   = SD / median (measures precision)        │
+# │    gate_class                  — "Below LLOQ", "Within Range", "Above ULOQ"│
+# │                                                                             │
+# │  How credible intervals are computed:                                       │
+# │    For each sample MFI value, we invert the curve using ALL 2000 posterior │
+# │    draws of (a,b,c,d,g). Each draw gives a different concentration.        │
+# │    The median of those 2000 concentrations = raw_predicted_concentration.  │
+# │    The 2.5th and 97.5th percentiles = conc_lower / conc_upper.            │
+# │    This captures BOTH curve parameter uncertainty AND the nonlinear        │
+# │    transformation uncertainty (wider CIs near the asymptotes).             │
+# │                                                                             │
+# │  Why pcov matters:                                                          │
+# │    pCoV (predicted coefficient of variation) tells you how precisely the   │
+# │    assay can measure this particular sample. Low pCoV (< 20%) means the   │
+# │    measurement is in the reliable "sweet spot" of the curve. High pCoV     │
+# │    (> 50%) means the sample is near an asymptote where small MFI changes  │
+# │    map to huge concentration changes — the assay can't resolve it well.    │
+# │                                                                             │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  TABLE 3: bayes_ensemble — Model comparison (3 rows per plate×antigen)     │
+# │                                                                             │
+# │  FK: bayes_curves_id → bayes_curves                                        │
+# │  NK: (project_id, study, experiment, plateid, antigen, family)             │
+# │                                                                             │
+# │  For each of the 3 families (4pl, 5pl, gompertz), stores:                  │
+# │    plate_elpd              — LOO-ELPD for this plate + family              │
+# │    is_plate_best           — TRUE if this family won for this plate        │
+# │    global_stacking_weight  — ensemble weight across ALL plates             │
+# │    is_global_best          — TRUE if this family has highest global weight │
+# │                                                                             │
+# │  Parameter posteriors with 95% CIs:                                        │
+# │    a / a_lower / a_upper   — lower asymptote and its CI                   │
+# │    b / b_lower / b_upper   — slope and its CI                             │
+# │    c / c_lower / c_upper   — EC50 and its CI                              │
+# │    d / d_lower / d_upper   — upper asymptote and its CI                   │
+# │    g / g_lower / g_upper   — asymmetry and its CI (NA for gompertz)       │
+# │                                                                             │
+# │  NOTE: These are per-PARAMETER marginal CIs, not joint. You cannot use    │
+# │  them to reconstruct the credible interval ribbon on the plot (that        │
+# │  requires correlated draws). That's what bayes_curve_grid is for.          │
+# │                                                                             │
+# │  Why is the ensemble per plateid+antigen (not per source)?                 │
+# │  The hierarchical model fits ALL plates of a given antigen together.       │
+# │  Model comparison (4PL vs 5PL vs Gompertz) is done at the global level    │
+# │  across all plates, then ELPD is reported per-plate. Different sources    │
+# │  on the same plate share the same model selection.                          │
+# │                                                                             │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  TABLE 4: bayes_curve_grid — Fitted curve + CI ribbon (100 rows per fit)   │
+# │                                                                             │
+# │  FK: bayes_curves_id → bayes_curves                                        │
+# │                                                                             │
+# │  100 log-spaced points from min to max standard concentration:             │
+# │    log10_conc    — x-axis value (log10 of concentration)                   │
+# │    concentration — x-axis value (linear concentration)                     │
+# │    mfi_median    — posterior median MFI at this concentration              │
+# │    mfi_lower_95  — 2.5th percentile MFI (lower CI bound)                  │
+# │    mfi_upper_95  — 97.5th percentile MFI (upper CI bound)                 │
+# │                                                                             │
+# │  How to plot the fitted curve:                                              │
+# │    x-axis: log10_conc                                                       │
+# │    blue line: log10(mfi_median)                                             │
+# │    CI ribbon: log10(mfi_lower_95) to log10(mfi_upper_95)                   │
+# │                                                                             │
+# │  Why store this instead of recomputing from params?                        │
+# │  The CI ribbon requires 200 CORRELATED posterior draws of (a,b,c,d,g)     │
+# │  evaluated at each x-point, then taking pointwise quantiles. You cannot   │
+# │  reconstruct this from the marginal CIs in bayes_ensemble — the params    │
+# │  are correlated (e.g. when a is high, d tends to be higher too). Using    │
+# │  independent draws from [a_lower, a_upper] × [d_lower, d_upper] gives    │
+# │  wildly wrong (too wide) ribbons. We learned this the hard way.            │
+# │                                                                             │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  TABLE 5: bayes_cdan_grid — CDAN precision profile (200 rows per fit)      │
+# │                                                                             │
+# │  FK: bayes_curves_id → bayes_curves                                        │
+# │                                                                             │
+# │  200 log-spaced points covering the standard concentration range:          │
+# │    log10_conc    — x-axis value                                             │
+# │    concentration — linear concentration                                     │
+# │    cv_percent    — raw CV% at this concentration (noisy)                   │
+# │    smoothed_cv   — LOESS-smoothed CV% (this is what gets plotted)          │
+# │    median_mu     — median predicted MFI at this concentration              │
+# │                                                                             │
+# │  How to plot the CDAN precision profile:                                   │
+# │    This goes on a SECONDARY Y-axis (right side) overlaid on the curve:    │
+# │    x-axis: log10_conc (shared with the fitted curve)                       │
+# │    y2-axis: smoothed_cv (range 0–55%)                                      │
+# │    Add horizontal threshold lines at 15% and 20% CV                        │
+# │    Where the U-shaped curve dips below 20% = dynamic range (LLOQ to ULOQ) │
+# │                                                                             │
+# │  What is CDAN?                                                              │
+# │  Concentration-Dependent Analytical Noise. At each concentration, the     │
+# │  CV% tells you how precisely the assay can measure. The U-shape comes     │
+# │  from: low concentrations have high noise (near blank), middle has low     │
+# │  noise (steep part of the curve = good sensitivity), high concentrations   │
+# │  have high noise again (near upper asymptote, curve is flat).              │
+# │                                                                             │
+# │  Why store this instead of recomputing?                                    │
+# │  Computing CDAN requires the NOISE MODEL parameters (theta_base,          │
+# │  theta_prop, gamma) from the Stan fit — these describe how measurement    │
+# │  variance depends on signal level. We don't store these params in the DB  │
+# │  (they're shared across plates, not per-plate), so we pre-compute the     │
+# │  profile and store the grid.                                                │
+# │                                                                             │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  WRITE STRATEGY                                                             │
+# │                                                                             │
+# │  bayes_curves, bayes_samples, bayes_ensemble:                              │
+# │    INSERT ... ON CONFLICT (natural_key) DO UPDATE SET ...                  │
+# │    Idempotent — re-running a job overwrites previous results safely.       │
+# │                                                                             │
+# │  bayes_curve_grid, bayes_cdan_grid:                                        │
+# │    DELETE WHERE (plateid, antigen, source) then INSERT                     │
+# │    These have no natural key (just grid points). Delete-and-reinsert       │
+# │    is simpler and avoids the many-row ON CONFLICT overhead.                │
+# │                                                                             │
+# │  FK relationships:                                                          │
+# │    bayes_curves is the parent. After upserting curves, we fetch back the   │
+# │    bayes_curves_id and join it to samples/ensemble/grids before saving.    │
+# │    This ensures referential integrity across all 5 tables.                 │
 # └─────────────────────────────────────────────────────────────────────────────┘
 #
 # ┌─────────────────────────────────────────────────────────────────────────────┐
