@@ -50,13 +50,18 @@ RUN R -e "install.packages(c('rstan', 'rstantools', 'StanHeaders', 'loo', 'R6', 
 RUN R -e "install.packages(c('RPostgres', 'DBI', 'dplyr', 'ggplot2', 'plotly', 'jsonlite'), repos='https://cloud.r-project.org/')"
 
 # ── Install stanassay from GitHub ────────────────────────────────────────────
-# stanassay is public on GitHub (immunoplex/stanassay).
+# stanassay is a private repo (immunoplex/stanassay).
+# GITHUB_PAT is passed as a build secret for CI, or set in environment for local.
 # Stan C++ → .so compilation happens here at build time (~5-10 min, cached).
-# To use a local tarball instead (for dev), uncomment the two lines below
-# and comment out the install_github line.
-# COPY stanassay_*.tar.gz /tmp/
-# RUN R CMD INSTALL /tmp/stanassay_*.tar.gz && rm /tmp/stanassay_*.tar.gz
-RUN R -e "devtools::install_github('immunoplex/stanassay', upgrade='never', quiet=FALSE)"
+#
+# For local dev with tarball instead:
+#   COPY stanassay_*.tar.gz /tmp/
+#   RUN R CMD INSTALL /tmp/stanassay_*.tar.gz && rm /tmp/stanassay_*.tar.gz
+ARG GITHUB_PAT=""
+RUN R -e "\
+  pat <- Sys.getenv('GITHUB_PAT', unset='${GITHUB_PAT}'); \
+  if (nzchar(pat)) Sys.setenv(GITHUB_PAT=pat); \
+  devtools::install_github('immunoplex/stanassay', upgrade='never', quiet=FALSE)"
 
 # ── Copy worker scripts ─────────────────────────────────────────────────────
 
