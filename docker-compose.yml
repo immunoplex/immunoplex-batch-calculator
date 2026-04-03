@@ -1,0 +1,122 @@
+# =============================================================================
+# docker-compose.yml — Local Development Stack
+#
+# Services:
+#   redis   — Redis 7 for job queue and status
+#   api     — FastAPI batch job API (port 8000)
+#   worker  — R worker with Python supervisor
+#
+# The worker connects to your HOST PostgreSQL (local_madi_ispi).
+# stanassay is baked into the worker image from tarball (compiled at build time).
+#
+# First build:
+#   cp ../stanassay/stanassay_*.tar.gz worker/   # already done
+#   docker compose up --build                     # ~10 min first time (Stan compilation)
+#
+# If you change stanassay code:
+#   cd ../stanassay && R CMD build . --no-manual --no-vignettes
+#   cp stanassay_*.tar.gz ../immunoplex_batch_calculator/worker/
+#   docker compose build worker
+#
+# Usage:
+#   docker compose up --build
+#
+#   # Submit a job (study-level — all experiments):
+#   curl -X POST http://localhost:8000/jobs \
+#     -H "Content-Type: application/json" \
+#     -H "X-API-Key: dev-key-immunoplex" \
+#     -d '{"study":"MADI_P3_GAPS","scope":"study"}'
+#
+#   # Submit a job (single experiment):
+#   curl -X POST http://localhost:8000/jobs \
+#     -H "Content-Type: application/json" \
+#     -H "X-API-Key: dev-key-immunoplex" \
+#     -d '{"study":"MADI_P3_GAPS","experiment":"EXP_001","scope":"experiment"}'
+#
+#   # List all jobs:
+#   curl -H "X-API-Key: dev-key-immunoplex" http://localhost:8000/jobs
+#
+#   # Check a specific job:
+#   curl -H "X-API-Key: dev-key-immunoplex" http://localhost:8000/jobs/{job_id}
+#
+#   # Cancel a job:
+#   curl -X DELETE -H "X-API-Key: dev-key-immunoplex" http://localhost:8000/jobs/{job_id}
+#
+#   # Health check (no auth needed):
+#   curl http://localhost:8000/health
+#
+#   # Swagger UI (interactive docs):
+#   open http://localhost:8000/docs
+# =============================================================================
+
+services:
+
+  redis:
+    image: redis:7
+    ports:
+      - "6380:6379"  # 6380 on host to avoid conflicts with any local Redis
+    command: ["redis-server", "--requirepass", "devpassword"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "devpassword", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: ./api
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: devpassword
+      REDIS_DB: "0"
+      API_KEY: dev-key-immunoplex
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./worker
+    environment:
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: devpassword
+      REDIS_DB: "0"
+      # PostgreSQL — connects to host machine's PostgreSQL
+      DB_NAME: local_madi_ispi
+      DB_HOST: host.docker.internal  # macOS/Windows Docker Desktop
+      DB_PORT: "5432"
+      DB_USER: hardik
+      DB_PASSWORD: ""
+      DB_SSLMODE: disable
+      # Output
+      OUTPUT_DIR: /data/bayes
+      PROGRESS_DIR: /tmp
+    volumes:
+      # stanassay is baked into the image from tarball.
+      # Uncomment the line below ONLY if you're iterating on stanassay code
+      # and want to test without rebuilding the image (entrypoint will reinstall):
+      # - ../stanassay:/stanassay:ro
+      #
+      # Shared output volume for .RData results
+      - bayes-output:/data/bayes
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Give the worker enough resources for Stan MCMC
+    # Adjust based on your machine
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+          memory: 8G
+
+volumes:
+  bayes-output:
+    driver: local

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.RData
+
+# Docker
+.env
+
+# stanassay tarball (use devtools::install_github in CI, tarball for local dev only)
+worker/stanassay_*.tar.gz
+
+# Output
+batch_output/
+plots/
+*.zip
+*.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
