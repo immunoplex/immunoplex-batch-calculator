@@ -269,92 +269,53 @@ message(sprintf("Worker starting: study=%s experiment=%s scope=%s job_id=%s proj
 
 
 # ─── Threading ───────────────────────────────────────────────────────────────
-# Machine-agnostic auto-scaling: works from 2 cores to 80+ cores.
+# Machine-agnostic. Matches HPC pattern from i-spi/research/hpc_bayes_batch.R.
 #
-# Stan has two levels of parallelism:
-#   1. Between-chain: rstan runs N_CHAINS chains on `cores` CPU processes
-#   2. Within-chain:  reduce_sum splits likelihood across STAN_NUM_THREADS
-#      (stanassay models are compiled with reduce_sum for this)
+# Parallelism strategy:
+#   - Each antigen fit uses 4 chains × 1 core/chain = 4 cores
+#   - Multiple antigens run in parallel via mclapply
+#   - N_PARALLEL_ANTIGENS = floor(available_cores / 4)
+#   - No within-chain threading (STAN_NUM_THREADS=1) — rstan's reduce_sum
+#     via TBB doesn't reliably help with typical immunoassay dataset sizes
 #
-# Strategy: throw all available cores at one combo at a time.
-# We process combos sequentially (for per-combo DB saves + progress).
-#
-# Auto-scaling rules:
-#   - Always want 4 chains (minimum for convergence diagnostics / Rhat)
-#   - On small machines (<=6 cores): 4 chains, 1 thread each, run chains
-#     sequentially if needed (rstan handles this — chains=4, cores=min(4, avail))
-#   - On medium machines (8-16 cores): 4 chains in parallel, 1-3 threads each
-#   - On large machines (32+ cores): 4 chains, many threads each via reduce_sum
-#   - Always leave 2 cores free for supervisor + OS
+# Examples:
+#    4 cores →  1 antigen  × 4 chains =  4 cores (sequential)
+#    8 cores →  2 antigens × 4 chains =  8 cores
+#   16 cores →  4 antigens × 4 chains = 16 cores
+#   32 cores →  8 antigens × 4 chains = 32 cores
+#   80 cores → 20 antigens × 4 chains = 80 cores
 
-# Detect available cores — respect K8s/cgroup CPU limits, not just host cores.
-# In containers, detectCores() often returns the HOST core count (e.g. 80)
-# but the pod may be limited to 8 via K8s resource limits.
-# The cgroup CPU quota is the authoritative limit.
-detect_effective_cores <- function() {
-  # Try cgroup v2 (modern K8s)
-  quota <- tryCatch(
-    as.numeric(readLines("/sys/fs/cgroup/cpu.max", warn = FALSE)[1]),
-    error = function(e) NA)
-  if (!is.na(quota) && quota > 0) {
-    period <- tryCatch({
-      parts <- strsplit(readLines("/sys/fs/cgroup/cpu.max", warn = FALSE), " ")[[1]]
-      as.numeric(parts[2])
-    }, error = function(e) 100000)
-    return(max(1L, as.integer(floor(quota / period))))
-  }
-  # Try cgroup v1 (older K8s)
-  quota_v1 <- tryCatch(
-    as.numeric(readLines("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", warn = FALSE)),
-    error = function(e) -1)
-  if (quota_v1 > 0) {
-    period_v1 <- tryCatch(
-      as.numeric(readLines("/sys/fs/cgroup/cpu/cpu.cfs_period_us", warn = FALSE)),
-      error = function(e) 100000)
-    return(max(1L, as.integer(floor(quota_v1 / period_v1))))
-  }
-  # Fallback: nproc (respects cgroup on modern kernels) or detectCores
-  nproc <- tryCatch(as.integer(system("nproc", intern = TRUE)), error = function(e) NA)
-  if (!is.na(nproc) && nproc > 0) return(nproc)
-  cores <- parallel::detectCores(logical = FALSE)
-  if (is.na(cores)) cores <- parallel::detectCores()
-  if (is.na(cores)) cores <- 4L
-  cores
-}
+# Detect available cores (nproc is reliable in containers)
+AVAILABLE_CORES <- tryCatch(
+  as.integer(system("nproc", intern = TRUE)),
+  error = function(e) {
+    cores <- parallel::detectCores(logical = FALSE)
+    if (is.na(cores)) cores <- parallel::detectCores()
+    if (is.na(cores)) cores <- 4L
+    cores
+  })
 
-AVAILABLE_CORES <- detect_effective_cores()
+N_CHAINS          <- 4L
+THREADS_PER_CHAIN <- 1L
+N_ITER            <- 1000L
+FAMILIES          <- c("4pl", "5pl", "gompertz")
 
-N_CHAINS <- 4L
-N_ITER   <- 1000L
-FAMILIES <- c("4pl", "5pl", "gompertz")
+# How many antigens to run in parallel via mclapply
+# Each antigen uses N_CHAINS cores, so max parallel = floor(avail / N_CHAINS)
+N_PARALLEL_ANTIGENS <- max(1L, floor(AVAILABLE_CORES / N_CHAINS))
 
-# Reserve 1 core for supervisor (minimum 2 usable)
-USABLE_CORES <- max(2L, AVAILABLE_CORES - 1L)
-
-# Chains that can run in parallel (capped at N_CHAINS)
-CORES_FOR_CHAINS <- min(N_CHAINS, USABLE_CORES)
-
-# Within-chain threading via reduce_sum.
-# Cap at 4 threads per chain — beyond that, TBB scheduling overhead dominates
-# for typical immunoassay datasets (100-500 observations per plate set).
-# Benchmarks: 1→2 threads gives ~1.5x speedup, 2→4 gives ~1.3x, 4→8 gives <1.1x.
-# Total: 4 chains × 4 threads = 16 cores max, which is the practical sweet spot.
-MAX_TPC <- 4L
-THREADS_PER_CHAIN <- min(MAX_TPC, max(1L, floor(USABLE_CORES / CORES_FOR_CHAINS)))
-
-# Set environment
-Sys.setenv(STAN_NUM_THREADS = as.character(THREADS_PER_CHAIN))
-Sys.setenv(MC_CORES = as.character(CORES_FOR_CHAINS))
-# Keep BLAS/LAPACK single-threaded to avoid oversubscription with Stan threads
+# Lock threading: 1 thread per chain, no TBB, no OpenMP
+Sys.setenv(STAN_NUM_THREADS = "1")
+Sys.setenv(MC_CORES = as.character(N_CHAINS))
 Sys.setenv(OMP_NUM_THREADS = "1")
 Sys.setenv(OPENBLAS_NUM_THREADS = "1")
 Sys.setenv(MKL_NUM_THREADS = "1")
 Sys.setenv(BLIS_NUM_THREADS = "1")
-options(mc.cores = CORES_FOR_CHAINS, warn = 1)
+options(mc.cores = N_CHAINS, warn = 1)
 
-message(sprintf("Threading: %d physical cores, %d usable, %d chains (cores=%d) x %d threads/chain = %d total",
-                AVAILABLE_CORES, USABLE_CORES, N_CHAINS, CORES_FOR_CHAINS,
-                THREADS_PER_CHAIN, CORES_FOR_CHAINS * THREADS_PER_CHAIN))
+message(sprintf("Threading: %d cores, %d parallel antigens x %d chains = %d cores used",
+                AVAILABLE_CORES, N_PARALLEL_ANTIGENS, N_CHAINS,
+                N_PARALLEL_ANTIGENS * N_CHAINS))
 
 
 # ─── Progress Reporting ──────────────────────────────────────────────────────
@@ -704,7 +665,7 @@ fit_one <- function(conn, study, experiment, antigen,
     )
     suppressWarnings(a$fit_ensemble(
       families = FAMILIES, error_model = "exact", n_iter = N_ITER,
-      n_chains = N_CHAINS, cores = CORES_FOR_CHAINS,
+      n_chains = N_CHAINS, cores = N_CHAINS,
       threads_per_chain = THREADS_PER_CHAIN, grainsize = 1L, refresh = 0L
     ))
     a
@@ -1116,7 +1077,13 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
 
 
 # =============================================================================
-# MAIN — Sequential processing, save to DB after each antigen combo
+# MAIN — Parallel antigens via mclapply, save to DB after each batch
+#
+# Same pattern as i-spi/research/hpc_bayes_batch.R:
+#   - mclapply runs N_PARALLEL_ANTIGENS at once
+#   - Each antigen uses 4 cores (4 chains × 1 thread)
+#   - After each parallel batch completes, save all results to DB
+#   - Progress updated per batch
 # =============================================================================
 
 conn <- open_conn()
@@ -1147,7 +1114,8 @@ message(sprintf("\n==== Batch Worker ===="))
 message(sprintf("  Study: %s  |  Project: %d", PARAMS$study, PARAMS$project_id))
 message(sprintf("  Scope: %s", PARAMS$scope))
 message(sprintf("  %d combos across %d experiments", total_combos, experiments_total))
-message(sprintf("  Chains: %d  |  CDAN CV threshold: %.1f%%\n", N_CHAINS, PARAMS$cdan_cv))
+message(sprintf("  Chains: %d  |  Parallel antigens: %d  |  CDAN CV: %.1f%%\n",
+                N_CHAINS, N_PARALLEL_ANTIGENS, PARAMS$cdan_cv))
 
 write_progress(total_combos, 0L, "", "", experiments_done, experiments_total)
 
@@ -1156,48 +1124,57 @@ batch_start <- Sys.time()
 for (exp_name in experiments) {
   exp_combos <- combos[combos$experiment_accession == exp_name, ]
   n_ag <- nrow(exp_combos)
-  message(sprintf("\n======== %s (%d antigens) ========", exp_name, n_ag))
+  message(sprintf("\n======== %s (%d antigens, %d parallel) ========",
+                  exp_name, n_ag, min(n_ag, N_PARALLEL_ANTIGENS)))
 
-  # Process each antigen combo sequentially — save to DB after each
-  for (i in seq_len(n_ag)) {
+  antigen_labels <- paste(exp_combos$antigen, collapse = ", ")
+  write_progress(total_combos, completed_combos, exp_name, antigen_labels,
+                 experiments_done, experiments_total)
+
+  # Run antigens in parallel via mclapply (same as hpc_bayes_batch.R)
+  t0 <- Sys.time()
+  results_list <- mclapply(seq_len(n_ag), function(i) {
     r <- exp_combos[i, ]
-    combo_label <- sprintf("%s | %s", exp_name, r$antigen)
-
-    write_progress(total_combos, completed_combos, exp_name, r$antigen,
-                   experiments_done, experiments_total)
-
     conn_local <- open_conn()
-    t0 <- Sys.time()
+    on.exit(DBI::dbDisconnect(conn_local))
+    t_start <- Sys.time()
     result <- tryCatch(
       fit_one(conn_local, r$study_accession, r$experiment_accession, r$antigen,
               r$feature, r$source, r$wavelength, r$project_id,
               cdan_cv = PARAMS$cdan_cv),
       error = function(e) { message("  FATAL: ", e$message); NULL }
     )
-    DBI::dbDisconnect(conn_local)
-    el <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
-
+    el <- as.numeric(difftime(Sys.time(), t_start, units = "secs"))
     if (!is.null(result)) {
-      message(sprintf("  OK %s %.1fs (%d curves, %d samples)",
-                      combo_label, el,
+      message(sprintf("  OK %s | %s %.1fs (%d curves, %d samples)",
+                      exp_name, r$antigen, el,
                       nrow(result$curves), nrow(result$samples) %||% 0L))
-
-      # Save to DB immediately after each combo
-      tryCatch({
-        message(sprintf("  Saving %s to DB...", combo_label))
-        save_to_db(result$curves, result$samples, result$ensemble, PARAMS$job_id,
-                   df_curve_grid = result$curve_grid, df_cdan_grid = result$cdan_grid)
-      }, error = function(e) {
-        message(sprintf("  DB SAVE ERROR for %s: %s", combo_label, e$message))
-      })
     } else {
-      message(sprintf("  FAIL %s %.1fs", combo_label, el))
+      message(sprintf("  FAIL %s | %s %.1fs", exp_name, r$antigen, el))
     }
+    result
+  }, mc.cores = N_PARALLEL_ANTIGENS)
+  batch_el <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
 
-    completed_combos <- completed_combos + 1L
-    write_progress(total_combos, completed_combos, exp_name, r$antigen,
-                   experiments_done, experiments_total)
+  # Save all results from this batch to DB
+  n_ok <- 0L
+  for (i in seq_along(results_list)) {
+    result <- results_list[[i]]
+    if (is.null(result)) next
+    r <- exp_combos[i, ]
+    combo_label <- sprintf("%s | %s", exp_name, r$antigen)
+    tryCatch({
+      message(sprintf("  Saving %s to DB...", combo_label))
+      save_to_db(result$curves, result$samples, result$ensemble, PARAMS$job_id,
+                 df_curve_grid = result$curve_grid, df_cdan_grid = result$cdan_grid)
+      n_ok <- n_ok + 1L
+    }, error = function(e) {
+      message(sprintf("  DB SAVE ERROR for %s: %s", combo_label, e$message))
+    })
   }
+
+  completed_combos <- completed_combos + n_ag
+  message(sprintf("  Batch done: %d/%d saved in %.1fs", n_ok, n_ag, batch_el))
 
   experiments_done <- experiments_done + 1L
   write_progress(total_combos, completed_combos, exp_name, "done",
