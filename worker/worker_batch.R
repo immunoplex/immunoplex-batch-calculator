@@ -335,9 +335,12 @@ USABLE_CORES <- max(2L, AVAILABLE_CORES - 1L)
 CORES_FOR_CHAINS <- min(N_CHAINS, USABLE_CORES)
 
 # Within-chain threading via reduce_sum.
-# Sweet spot: 1-4 threads per chain for typical immunoassay data (100-500 obs).
-# Beyond ~4, TBB overhead can dominate for small datasets.
-THREADS_PER_CHAIN <- max(1L, floor(USABLE_CORES / CORES_FOR_CHAINS))
+# Cap at 4 threads per chain — beyond that, TBB scheduling overhead dominates
+# for typical immunoassay datasets (100-500 observations per plate set).
+# Benchmarks: 1→2 threads gives ~1.5x speedup, 2→4 gives ~1.3x, 4→8 gives <1.1x.
+# Total: 4 chains × 4 threads = 16 cores max, which is the practical sweet spot.
+MAX_TPC <- 4L
+THREADS_PER_CHAIN <- min(MAX_TPC, max(1L, floor(USABLE_CORES / CORES_FOR_CHAINS)))
 
 # Set environment
 Sys.setenv(STAN_NUM_THREADS = as.character(THREADS_PER_CHAIN))
