@@ -269,29 +269,50 @@ message(sprintf("Worker starting: study=%s experiment=%s scope=%s job_id=%s proj
 
 
 # ─── Threading ───────────────────────────────────────────────────────────────
-# Use all available cores minus 2 (leave headroom for supervisor + OS)
+# Strategy: throw all available cores at ONE combo at a time.
+# Since we process combos sequentially (for progress + DB saves), there's no
+# benefit to reserving cores for parallel antigens.
+#
+# Stan has two levels of parallelism:
+#   1. Between-chain: rstan runs N_CHAINS chains on `cores` processes
+#   2. Within-chain: reduce_sum splits the likelihood across STAN_NUM_THREADS
+#      (requires models compiled with reduce_sum — stanassay's models have this)
+#
+# Total CPU = cores × threads_per_chain (capped at available physical cores)
+#
+# For 80-core machine: 4 chains × 16 threads/chain = 64 cores (leaves 16 for OS)
+# For 8-core machine:  4 chains × 1 thread/chain = 4 cores (conservative)
+# For 4-core machine:  4 chains × 1 thread/chain = 4 cores (minimum)
 
-AVAILABLE_CORES <- max(1L, parallel::detectCores(logical = FALSE) - 2L)
+AVAILABLE_CORES <- max(1L, parallel::detectCores(logical = FALSE))
 N_CHAINS        <- 4L
-THREADS_PER_CHAIN <- 1L
 N_ITER          <- 1000L
 FAMILIES        <- c("4pl", "5pl", "gompertz")
 
-# How many antigens to run in parallel via mclapply
-# Each antigen uses N_CHAINS cores, so max parallel antigens = floor(AVAILABLE_CORES / N_CHAINS)
-N_PARALLEL_ANTIGENS <- max(1L, floor(AVAILABLE_CORES / N_CHAINS))
+# Compute threads_per_chain: use all available cores divided among chains,
+# leaving a few cores free for supervisor + OS
+usable_cores <- max(N_CHAINS, AVAILABLE_CORES - 2L)
+THREADS_PER_CHAIN <- max(1L, floor(usable_cores / N_CHAINS))
 
-Sys.setenv(STAN_NUM_THREADS = "1")
+# Cap total threads to not exceed available
+total_threads <- N_CHAINS * THREADS_PER_CHAIN
+if (total_threads > AVAILABLE_CORES) {
+  THREADS_PER_CHAIN <- max(1L, floor(AVAILABLE_CORES / N_CHAINS))
+}
+
+# Set environment for Stan threading
+Sys.setenv(STAN_NUM_THREADS = as.character(THREADS_PER_CHAIN))
 Sys.setenv(MC_CORES = as.character(N_CHAINS))
+# Keep BLAS/LAPACK single-threaded to avoid oversubscription with Stan threads
 Sys.setenv(OMP_NUM_THREADS = "1")
 Sys.setenv(OPENBLAS_NUM_THREADS = "1")
 Sys.setenv(MKL_NUM_THREADS = "1")
 Sys.setenv(BLIS_NUM_THREADS = "1")
 options(mc.cores = N_CHAINS, warn = 1)
 
-message(sprintf("Threading: %d available cores, %d parallel antigens x %d chains = %d used",
-                AVAILABLE_CORES, N_PARALLEL_ANTIGENS, N_CHAINS,
-                N_PARALLEL_ANTIGENS * N_CHAINS))
+message(sprintf("Threading: %d physical cores, %d chains x %d threads/chain = %d total",
+                AVAILABLE_CORES, N_CHAINS, THREADS_PER_CHAIN,
+                N_CHAINS * THREADS_PER_CHAIN))
 
 
 # ─── Progress Reporting ──────────────────────────────────────────────────────
