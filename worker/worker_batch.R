@@ -19,7 +19,7 @@
 # │    4. Fits a 3-family ensemble (4PL, 5PL, Gompertz) via Stan MCMC         │
 # │    5. Computes diagnostics (LOQ, LOD, LRDL, URDL, inflection, etc.)       │
 # │    6. Back-calculates sample concentrations with credible intervals         │
-# │    7. Saves everything to PostgreSQL (5 tables) after each combo           │
+# │    7. Saves everything to PostgreSQL (6 tables) after each combo           │
 # │    8. Writes a progress JSON file for real-time monitoring                  │
 # └─────────────────────────────────────────────────────────────────────────────┘
 #
@@ -134,7 +134,7 @@
 # └─────────────────────────────────────────────────────────────────────────────┘
 #
 # ┌─────────────────────────────────────────────────────────────────────────────┐
-# │  DATABASE OUTPUT — 5 tables in madi_results schema                          │
+# │  DATABASE OUTPUT — 6 tables in madi_results schema                          │
 # │                                                                             │
 # │  How to trace a single standard curve:                                      │
 # │  ─────────────────────────────────────                                      │
@@ -170,6 +170,12 @@
 # │     WHERE plateid='PLATE_01' AND antigen='gamma'                           │
 # │       AND source='NIBSC06_140' ORDER BY log10_conc;                        │
 # │     → 200 points: smoothed_cv is the CDAN precision curve (right y-axis)  │
+# │                                                                             │
+# │  6. bayes_pareto_k: LOO Pareto k diagnostics for this antigen             │
+# │     SELECT * FROM madi_results.bayes_pareto_k                             │
+# │     WHERE study_accession='ALPHA' AND experiment_accession='BETA'         │
+# │       AND antigen='gamma';                                                 │
+# │     → 3 rows (4pl, 5pl, gompertz): n_good/n_ok/n_bad/n_vbad/max_k        │
 # │                                                                             │
 # │  Why separate sources?                                                      │
 # │  ────────────────────                                                       │
@@ -242,6 +248,15 @@
 # │    Stacking weights combine all 3 families into a weighted ensemble.       │
 # │    plate_best_family may differ from global_best_family — the global best  │
 # │    is used because it pools information across plates for robustness.       │
+# │                                                                             │
+# │  Asymmetry (4PL vs 5PL) — NULL for Gompertz fits:                          │
+# │    prob_4pl       — P(|mu_log_g| < 0.1): probability the batch is          │
+# │                     effectively symmetric. >0.8 symmetric, <0.3 asymmetric │
+# │    g_prior_mode   — label for the prior on mu_log_g                        │
+# │    g_mean / g_median / g_sd / g_q2p5 / g_q97p5                            │
+# │                   — per-plate posterior summary of g (asymmetry param)     │
+# │    mu_log_g_mean / _sd / _q2p5 / _q97p5                                   │
+# │                   — batch-level log(g) hyperparameter posterior summary    │
 # │                                                                             │
 # └─────────────────────────────────────────────────────────────────────────────┘
 #
@@ -369,6 +384,33 @@
 # └─────────────────────────────────────────────────────────────────────────────┘
 #
 # ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  TABLE 6: bayes_pareto_k — LOO Pareto k diagnostics (3 rows per antigen)   │
+# │                                                                             │
+# │  NK: (project_id, study_accession, experiment_accession, antigen, family)  │
+# │  No FK — not tied to a specific plate or source.                            │
+# │                                                                             │
+# │  For each of the 3 families (4pl, 5pl, gompertz):                          │
+# │    n_good  — observations with k ≤ 0.5 (LOO estimate reliable)             │
+# │    n_ok    — 0.5 < k ≤ 0.7 (acceptable)                                   │
+# │    n_bad   — 0.7 < k ≤ 1.0 (bad — LOO ELPD unreliable for these obs)     │
+# │    n_vbad  — k > 1.0 (very bad — LOO estimate may be very wrong)          │
+# │    max_k   — worst single Pareto k value in this family                    │
+# │                                                                             │
+# │  What Pareto k tells you:                                                   │
+# │    Pareto k is the shape parameter of the Pareto distribution fitted to    │
+# │    the importance sampling weights in LOO-CV. High k (> 0.7) means a      │
+# │    single observation is overly influential — the model fit changes a lot  │
+# │    when that observation is left out. This typically flags outlier         │
+# │    standard curve points or high-leverage wells.                           │
+# │    Rule of thumb: if n_bad + n_vbad > 0, inspect those standard wells.    │
+# │                                                                             │
+# │  Mirrors i-spi's "Pareto k Diagnostics" panel in the Model Comparisons    │
+# │  modal (bayes_state$pareto_k_summary). Previously only available from     │
+# │  a live Stan fit; now pre-computed and stored here.                         │
+# │                                                                             │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
 # │  WRITE STRATEGY                                                             │
 # │                                                                             │
 # │  bayes_curves, bayes_samples, bayes_ensemble:                              │
@@ -380,10 +422,14 @@
 # │    These have no natural key (just grid points). Delete-and-reinsert       │
 # │    is simpler and avoids the many-row ON CONFLICT overhead.                │
 # │                                                                             │
+# │  bayes_pareto_k:                                                            │
+# │    INSERT ... ON CONFLICT (project_id, study, experiment, antigen, family) │
+# │    DO UPDATE SET ... — idempotent upsert, no FK, no delete needed.        │
+# │                                                                             │
 # │  FK relationships:                                                          │
 # │    bayes_curves is the parent. After upserting curves, we fetch back the   │
 # │    bayes_curves_id and join it to samples/ensemble/grids before saving.    │
-# │    This ensures referential integrity across all 5 tables.                 │
+# │    This ensures referential integrity across all 6 tables.                 │
 # └─────────────────────────────────────────────────────────────────────────────┘
 #
 # ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -903,6 +949,38 @@ fit_one <- function(conn, study, experiment, antigen,
   stacking_wts <- ens$stacking_weights; global_best <- ens$best_family
   loo_comp <- ens$loo_comparison
   target_plates <- sort(unique(stds$plateid))
+
+  # ── Pareto k diagnostics (per family, across all plates in this fit) ───────
+  pareto_k_df <- NULL
+  if (!is.null(ens$loo_results) && length(ens$loo_results) > 0L) {
+    pk_rows <- lapply(names(ens$loo_results), function(nm) {
+      pk <- loo::pareto_k_values(ens$loo_results[[nm]])
+      data.frame(
+        project_id = project_id, study_accession = study, experiment_accession = experiment,
+        antigen = antigen, family = nm,
+        n_good = sum(pk <= 0.5), n_ok = sum(pk > 0.5 & pk <= 0.7),
+        n_bad  = sum(pk > 0.7 & pk <= 1.0), n_vbad = sum(pk > 1.0),
+        max_k  = max(pk),
+        stringsAsFactors = FALSE
+      )
+    })
+    pareto_k_df <- do.call(rbind, pk_rows)
+  }
+
+  # ── Asymmetry assessment (4PL vs 5PL) ─────────────────────────────────────
+  # Only meaningful for 4PL/5PL; skip for Gompertz (no g parameter).
+  asym <- NULL
+  if (!is.null(assay$fit_obj) &&
+      !is.null(assay$fit_obj$curve_family) &&
+      assay$fit_obj$curve_family != "gompertz") {
+    asym <- tryCatch(
+      assay$summarize_asymmetry(),
+      error = function(e) {
+        message(sprintf("  [asymmetry] summarize_asymmetry failed: %s", e$message))
+        NULL
+      }
+    )
+  }
   params <- extract_plate_params_v2(assay)
 
   plate_meta <- stds_raw |>
@@ -938,6 +1016,13 @@ fit_one <- function(conn, study, experiment, antigen,
     uod_conc <- safe_get(uod_res, "uod"); urdl_conc <- safe_get(urdl_res, "urdl")
     elpd_row <- if (plt %in% rownames(plate_elpd)) plate_elpd[plt, ] else rep(NA_real_, length(FAMILIES))
 
+    # Per-plate g posterior from asymmetry (NULL for gompertz fits)
+    g_row <- NULL
+    if (!is.null(asym) && !is.null(asym$g_plate)) {
+      g_row <- asym$g_plate[as.character(asym$g_plate$plateid) == as.character(plt), ]
+      if (nrow(g_row) == 0L) g_row <- NULL
+    }
+
     data.frame(
       project_id = project_id, study_accession = study, experiment_accession = experiment,
       plateid = plt,
@@ -963,6 +1048,19 @@ fit_one <- function(conn, study, experiment, antigen,
       global_stacking_gompertz = stacking_wts["gompertz"],
       global_best_family = global_best,
       cdan_method = if (!is.null(cdan) && !is.null(cdan$method)) cdan$method else NA_character_,
+      # Asymmetry — global (replicated per plate)
+      prob_4pl        = if (!is.null(asym)) asym$prob_4pl else NA_real_,
+      g_prior_mode    = if (!is.null(asym)) asym$g_prior_mode else NA_character_,
+      mu_log_g_mean   = if (!is.null(asym)) asym$mu_log_g["mean"]  else NA_real_,
+      mu_log_g_sd     = if (!is.null(asym)) asym$mu_log_g["sd"]    else NA_real_,
+      mu_log_g_q2p5   = if (!is.null(asym)) asym$mu_log_g["q2.5"]  else NA_real_,
+      mu_log_g_q97p5  = if (!is.null(asym)) asym$mu_log_g["q97.5"] else NA_real_,
+      # Asymmetry — per-plate g posterior
+      g_mean   = if (!is.null(g_row)) g_row$g_mean[1]   else NA_real_,
+      g_median = if (!is.null(g_row)) g_row$g_median[1] else NA_real_,
+      g_sd     = if (!is.null(g_row)) g_row$g_sd[1]     else NA_real_,
+      g_q2p5   = if (!is.null(g_row)) g_row$`g_q2.5`[1] else NA_real_,
+      g_q97p5  = if (!is.null(g_row)) g_row$`g_q97.5`[1] else NA_real_,
       stringsAsFactors = FALSE, row.names = NULL)
   })
   df_curves_local <- do.call(rbind, Filter(Negate(is.null), curve_rows))
@@ -1114,7 +1212,8 @@ fit_one <- function(conn, study, experiment, antigen,
   list(curves = df_curves_local, samples = df_samples_local,
        ensemble = df_ensemble_local, loo_comp = loo_comp,
        plots = plots_local,
-       curve_grid = df_curve_grid, cdan_grid = df_cdan_grid)
+       curve_grid = df_curve_grid, cdan_grid = df_cdan_grid,
+       pareto_k = pareto_k_df)
 }
 
 
@@ -1157,7 +1256,8 @@ upsert_on_conflict <- function(conn, schema, table, df, nk_cols) {
 
 
 save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
-                       df_curve_grid = NULL, df_cdan_grid = NULL) {
+                       df_curve_grid = NULL, df_cdan_grid = NULL,
+                       df_pareto_k = NULL) {
   conn <- open_conn()
   on.exit(DBI::dbDisconnect(conn), add = TRUE)
 
@@ -1298,6 +1398,15 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
     }
   }
 
+  # Save bayes_pareto_k (not FK'd to bayes_curves — NK is antigen × family)
+  if (!is.null(df_pareto_k) && nrow(df_pareto_k) > 0L) {
+    df_pareto_k$job_id <- job_id
+    pareto_k_nk <- c("project_id", "study_accession", "experiment_accession",
+                      "antigen", "family")
+    message("  Saving bayes_pareto_k...")
+    upsert_on_conflict(conn, "madi_results", "bayes_pareto_k", df_pareto_k, pareto_k_nk)
+  }
+
   message("  DB save complete.")
 }
 
@@ -1392,7 +1501,8 @@ for (exp_name in experiments) {
     tryCatch({
       message(sprintf("  Saving %s to DB...", combo_label))
       save_to_db(result$curves, result$samples, result$ensemble, PARAMS$job_id,
-                 df_curve_grid = result$curve_grid, df_cdan_grid = result$cdan_grid)
+                 df_curve_grid = result$curve_grid, df_cdan_grid = result$cdan_grid,
+                 df_pareto_k = result$pareto_k)
       n_ok <- n_ok + 1L
     }, error = function(e) {
       message(sprintf("  DB SAVE ERROR for %s: %s", combo_label, e$message))
