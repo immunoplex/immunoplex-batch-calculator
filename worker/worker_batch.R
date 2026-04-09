@@ -108,17 +108,22 @@
 # │     - LO2D/UO2D: second-derivative shoulder points (exact closed-form)    │
 # │     - Inflection: max |dy/dx| point with 95% credible interval            │
 # │                                                                             │
-# │  8. SAMPLE BACK-CALCULATION (compute_se_pcov_v2)                           │
-# │     For each sample MFI value:                                              │
-# │     a) Use stanassay's predict_concentration_bayesian() for point est + CI │
-# │     b) Extract full posterior via curve inverse: x = f⁻¹(MFI)             │
-# │        → raw_predicted_concentration = median of posterior draws           │
+# │  8. SAMPLE BACK-CALCULATION (assay$predict_samples)                         │
+# │     Single call: assay$predict_samples(samps) — stanassay handles all:     │
+# │     a) Posterior inverse: x = f⁻¹(MFI) across all MCMC draws              │
+# │        → predicted_conc_mean = median of posterior draws                   │
+# │        → predicted_conc_lower/upper = 2.5%/97.5% credible interval        │
 # │        → se_concentration = SD of posterior draws                           │
-# │        → pcov = SD/median (coefficient of variation)                       │
-# │        → conc_lower/conc_upper = 2.5%/97.5% credible interval             │
+# │     b) Delta Method pCoV using the FULL noise model:                       │
+# │        CV = sigma(mu) / |dmu/d(log x)|                                     │
+# │        where sigma = theta_base + theta_prop * |mu|^gamma                  │
+# │        This matches the CDAN precision profile exactly.                     │
 # │     c) Gate classification: Below LLOQ / Within Range / Above ULOQ        │
 # │     Concentrations are in the same units as the standard curve x-axis      │
 # │     (i.e. using standard_curve_concentration scaling).                      │
+# │                                                                             │
+# │     IMPORTANT: No math is done in the worker. All computations are in      │
+# │     stanassay/R/predict.R. The worker only maps column names for DB save.  │
 # │                                                                             │
 # │  9. PLOT DATA (curve_grid + cdan_grid)                                     │
 # │     Pre-computed grids for reconstructing the interactive plot from DB:     │
@@ -784,25 +789,16 @@ safe_get <- function(lst, key) {
 }
 
 
-eval_forward <- function(x, a, b, c, d, g = NA, family = "5pl") {
+# eval_forward() and compute_dydx_inflect() have been removed.
+# All curve math now lives in the stanassay package (curve_families.R).
+# For evaluating MFI at a single point (e.g. lloq_y), use a minimal inline:
+eval_forward_inline <- function(x, a, b, c, d, g = NA, family = "5pl") {
   if (is.null(x) || is.na(x) || x <= 0) return(NA_real_)
   lx <- log(x); lc <- log(c)
   if (family %in% c("4pl", "5pl")) {
     z <- exp(b * (lx - lc)); d + (a - d) / (1 + z)^g
   } else if (family == "gompertz") {
     u <- b * (lx - lc); d + (a - d) * exp(-exp(u))
-  } else NA_real_
-}
-
-
-compute_dydx_inflect <- function(a, b, c, d, g, x_infl, family) {
-  if (is.na(x_infl) || x_infl <= 0) return(NA_real_)
-  if (family %in% c("4pl", "5pl")) {
-    z <- if (family == "5pl" && !is.na(g) && g > 0) 1 / g else 1
-    dydlogx <- -(a - d) * (if (is.na(g)) 1 else g) * b * z / (1 + z)^((if (is.na(g)) 1 else g) + 1)
-    dydlogx / x_infl
-  } else if (family == "gompertz") {
-    -(a - d) * b * exp(-1) / x_infl
   } else NA_real_
 }
 
@@ -840,29 +836,13 @@ find_loq_custom <- function(cdan_result, threshold) {
 }
 
 
-compute_se_pcov_v2 <- function(plate_fit, plate_id, mfi_val) {
-  NA_r <- list(raw_predicted_concentration = NA_real_, se_concentration = NA_real_,
-               pcov = NA_real_, conc_lower = NA_real_, conc_upper = NA_real_)
-  pred <- tryCatch(stanassay:::predict_concentration_bayesian(plate_fit, plate_id, mfi_val),
-                   error = function(e) list(est = NA_real_, lower = NA_real_, upper = NA_real_))
-  if (is.na(pred$est)) return(NA_r)
-  pm <- plate_fit$plate_map
-  pi <- pm$plate_idx[as.character(pm$plateid) == as.character(plate_id)]
-  if (length(pi) == 0) return(NA_r)
-  params <- tryCatch(stanassay:::.extract_curve_params(plate_fit, pi), error = function(e) NULL)
-  if (is.null(params)) return(list(raw_predicted_concentration = pred$est,
-                                    se_concentration = NA_real_, pcov = NA_real_,
-                                    conc_lower = pred$lower, conc_upper = pred$upper))
-  inv <- tryCatch(stanassay:::.curve_inverse(params, mfi_val), error = function(e) NULL)
-  if (is.null(inv) || sum(inv$valid) < length(params$a) * 0.1)
-    return(list(raw_predicted_concentration = pred$est, se_concentration = NA_real_,
-                pcov = NA_real_, conc_lower = pred$lower, conc_upper = pred$upper))
-  x_pred <- exp(inv$log_x[inv$valid])
-  med <- median(x_pred); sdev <- sd(x_pred)
-  list(raw_predicted_concentration = med, se_concentration = sdev,
-       pcov = if (!is.na(med) && med > 0) sdev / med else NA_real_,
-       conc_lower = pred$lower, conc_upper = pred$upper)
-}
+# compute_se_pcov_v2() has been DELETED.
+# It was computing pcov = sd(x_pred)/median(x_pred) which only captures
+# epistemic parameter uncertainty and ignores the aleatoric noise model.
+# The correct Delta Method pCoV is now computed inside stanassay's
+# predict_concentration_bayesian() using the full noise model:
+#   CV = sigma(mu) / |dmu/d(log x)| where sigma = theta_base + theta_prop*|mu|^gamma
+# Workers should call assay$predict_samples(samps) instead.
 
 
 # ─── Fit One Antigen Combo ──────────────────────────────────────────────────
@@ -1003,8 +983,8 @@ fit_one <- function(conn, study, experiment, antigen,
     infl     <- tryCatch(assay$compute_inflection_point(plt), error = function(e) NULL)
 
     inflect_x <- safe_get(infl, "x_median"); inflect_y <- safe_get(infl, "y_median")
-    dydx <- compute_dydx_inflect(p$a, p$b, p$c, p$d, p$g, inflect_x, fam)
-    fwd <- function(x) eval_forward(x, p$a, p$b, p$c, p$d, p$g, fam)
+    dydx <- safe_get(infl, "dydx_at_inflection")  # from stanassay if available, else NA
+    fwd <- function(x) eval_forward_inline(x, p$a, p$b, p$c, p$d, p$g, fam)
 
     lloq_20 <- safe_get(cdan, "lloq_20"); uloq_20 <- safe_get(cdan, "uloq_20")
     lloq_15 <- safe_get(cdan, "lloq_15"); uloq_15 <- safe_get(cdan, "uloq_15")
@@ -1066,41 +1046,37 @@ fit_one <- function(conn, study, experiment, antigen,
   df_curves_local <- do.call(rbind, Filter(Negate(is.null), curve_rows))
 
   # ── df_samples ─────────────────────────────────────────────────────────
+  # Use assay$predict_samples() — the stanassay package handles everything:
+  #   - Posterior inverse for median + 95% CI
+  #   - Delta Method pCoV using the full noise model (theta_base, theta_prop, gamma)
+  #   - Gate classification (Below LLOQ / Within Range / Above ULOQ)
+  # This matches the pattern in i-spi/src/std_curver_ui.R line 3812.
   df_samples_local <- NULL
   if (nrow(samps) > 0L) {
-    message(sprintf("  Back-calculating %d samples...", nrow(samps)))
-    se_rows <- lapply(seq_len(nrow(samps)), function(i) {
-      plt <- samps$plateid[i]
-      pf <- tryCatch(assay$.__enclos_env__$private$.get_plate_fit_obj(plt),
-                     error = function(e) assay$fit_obj)
-      compute_se_pcov_v2(pf, plt, samps$mfi[i])
-    })
-    df_samples_local <- samps |>
-      mutate(project_id = project_id, study_accession = study, experiment_accession = experiment,
-             feature = feature, source = source_val, wavelength = wavelength,
-             raw_predicted_concentration = vapply(se_rows, `[[`, numeric(1), "raw_predicted_concentration"),
-             se_concentration = vapply(se_rows, `[[`, numeric(1), "se_concentration"),
-             pcov = vapply(se_rows, `[[`, numeric(1), "pcov"),
-             conc_lower = vapply(se_rows, `[[`, numeric(1), "conc_lower"),
-             conc_upper = vapply(se_rows, `[[`, numeric(1), "conc_upper"))
-    df_samples_local$gate_class <- NA_character_
-    for (plt in target_plates) {
-      cn <- tryCatch(assay$compute_cdan(plt), error = function(e) NULL)
-      if (is.null(cn)) next
-      ll <- safe_get(cn, "lloq_20"); ul <- safe_get(cn, "uloq_20")
-      if (is.na(ll) || is.na(ul)) next
-      mask <- df_samples_local$plateid == plt & !is.na(df_samples_local$raw_predicted_concentration)
-      cc <- df_samples_local$raw_predicted_concentration[mask]
-      df_samples_local$gate_class[mask] <- ifelse(cc < ll, "Below LLOQ",
-                                                   ifelse(cc > ul, "Above ULOQ", "Within Range"))
+    message(sprintf("  Back-calculating %d samples via assay$predict_samples()...", nrow(samps)))
+    results_df <- tryCatch(
+      assay$predict_samples(samps),
+      error = function(e) { message("  predict_samples ERROR: ", e$message); NULL }
+    )
+    if (!is.null(results_df) && nrow(results_df) > 0L) {
+      # Map stanassay column names to DB column names
+      df_samples_local <- results_df |>
+        mutate(
+          project_id = project_id, study_accession = study,
+          experiment_accession = experiment,
+          feature = feature, source = source_val, wavelength = wavelength,
+          raw_predicted_concentration = predicted_conc_mean,
+          conc_lower = predicted_conc_lower,
+          conc_upper = predicted_conc_upper
+          # se_concentration, pcov, gate_class come directly from predict_samples
+        ) |>
+        select(any_of(c("project_id", "study_accession", "experiment_accession",
+                         "plateid", "plate", "antigen", "feature",
+                         "nominal_sample_dilution", "source", "wavelength",
+                         "timeperiod", "patientid", "well", "sampleid", "dilution",
+                         "mfi", "raw_predicted_concentration", "se_concentration",
+                         "pcov", "conc_lower", "conc_upper", "gate_class")))
     }
-    df_samples_local <- df_samples_local |>
-      select(any_of(c("project_id", "study_accession", "experiment_accession",
-                       "plateid", "plate", "antigen", "feature",
-                       "nominal_sample_dilution", "source", "wavelength",
-                       "timeperiod", "patientid", "well", "sampleid", "dilution",
-                       "mfi", "raw_predicted_concentration", "se_concentration", "pcov",
-                       "conc_lower", "conc_upper", "gate_class")))
   }
 
   # ── df_ensemble (with 95% CIs for each parameter) ───────────────────
