@@ -50,7 +50,7 @@ RUN R -e "install.packages(c('RPostgres', 'DBI', 'dplyr', 'ggplot2', 'plotly', '
 # ── Install stanassay from GitHub ────────────────────────────────────────────
 # stanassay is a public package at immunoplex/stanassay.
 # Stan C++ → .so compilation happens here at build time (~5-10 min, cached).
-RUN R -e "devtools::install_github('immunoplex/stanassay', upgrade='never')"
+RUN R -e "install.packages('remotes', repos='https://cloud.r-project.org/'); remotes::install_github('immunoplex/stanassay', upgrade='never')"
 
 # ── Copy worker scripts ─────────────────────────────────────────────────────
 
