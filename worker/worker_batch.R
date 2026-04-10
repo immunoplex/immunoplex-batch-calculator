@@ -1238,58 +1238,67 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
   on.exit(DBI::dbDisconnect(conn), add = TRUE)
 
   # Add job_id (created_at is handled by DB DEFAULT NOW())
-  if (!is.null(df_curves) && nrow(df_curves) > 0) {
-    df_curves$job_id <- job_id
-  }
-  if (!is.null(df_samples) && nrow(df_samples) > 0) {
-    df_samples$job_id <- job_id
-  }
-  if (!is.null(df_ensemble) && nrow(df_ensemble) > 0) {
-    df_ensemble$job_id <- job_id
-  }
+  if (!is.null(df_curves)    && nrow(df_curves) > 0)    df_curves$job_id    <- job_id
+  if (!is.null(df_samples)   && nrow(df_samples) > 0)   df_samples$job_id   <- job_id
+  if (!is.null(df_ensemble)  && nrow(df_ensemble) > 0)  df_ensemble$job_id  <- job_id
 
-  curves_nk <- c("project_id", "study_accession", "experiment_accession",
-                  "plateid", "plate", "nominal_sample_dilution",
-                  "source", "wavelength", "antigen", "feature")
-  samples_nk <- c(curves_nk, "patientid", "timeperiod", "sampleid", "dilution")
+  curves_nk   <- c("project_id", "study_accession", "experiment_accession",
+                    "plateid", "plate", "nominal_sample_dilution",
+                    "source", "wavelength", "antigen", "feature")
+  samples_nk  <- c(curves_nk, "patientid", "timeperiod", "sampleid", "dilution")
   ensemble_nk <- c("project_id", "study_accession", "experiment_accession",
                     "plateid", "antigen", "family")
 
-  # 1. Upsert bayes_curves (parent)
-  message("  Saving bayes_curves...")
-  upsert_on_conflict(conn, "madi_results", "bayes_curves", df_curves, curves_nk)
-
-  # 2. Fetch back bayes_curves_id for FK joins
-  if (nrow(df_curves) > 0) {
-    study <- unique(df_curves$study_accession)[1]
-    proj <- unique(df_curves$project_id)[1]
+  if (!is.null(df_curves) && nrow(df_curves) > 0) {
+    proj    <- unique(df_curves$project_id)[1]
+    study   <- unique(df_curves$study_accession)[1]
     exp_list <- unique(df_curves$experiment_accession)
-    exp_sql <- paste0("'", paste(exp_list, collapse = "','"), "'")
+    exp_sql  <- paste0("'", paste(exp_list, collapse = "','"), "'")
+    nk_sql   <- paste(sprintf('"%s"', curves_nk), collapse = ", ")
 
+    # 1. Upsert curve_lookup — registers each combo and returns the shared curve_id
+    message("  Upserting curve_lookup...")
+    lookup_keys <- dplyr::distinct(df_curves[, curves_nk, drop = FALSE])
+    DBI::dbWriteTable(conn, "tmp_curve_lookup", lookup_keys, overwrite = TRUE, row.names = FALSE)
+    DBI::dbExecute(conn, sprintf(
+      "INSERT INTO madi_results.curve_lookup (%s)
+       SELECT %s FROM tmp_curve_lookup
+       ON CONFLICT (%s) DO NOTHING",
+      nk_sql, nk_sql, nk_sql
+    ))
+    DBI::dbRemoveTable(conn, "tmp_curve_lookup")
+
+    # Fetch back curve_id for all combos in this job
     lookup <- DBI::dbGetQuery(conn, sprintf(
-      "SELECT bayes_curves_id, project_id, study_accession, experiment_accession,
-              plateid, plate, nominal_sample_dilution, source, wavelength, antigen, feature
-       FROM madi_results.bayes_curves
+      "SELECT curve_id, %s
+       FROM madi_results.curve_lookup
        WHERE project_id = %d AND study_accession = '%s'
          AND experiment_accession IN (%s)",
-      proj, study, exp_sql
+      nk_sql, proj, study, exp_sql
     ))
 
-    # FK join for samples
+    # Stamp curve_id onto curves df before upserting
+    df_curves <- dplyr::inner_join(df_curves, lookup, by = curves_nk)
+
+    # 2. Upsert bayes_curves — conflict on curve_id (the shared PK from curve_lookup)
+    message("  Saving bayes_curves...")
+    upsert_on_conflict(conn, "madi_results", "bayes_curves", df_curves, c("curve_id"))
+
+    # 3. FK join for samples — stamp curve_id, then upsert
     if (!is.null(df_samples) && nrow(df_samples) > 0) {
       df_samples <- dplyr::inner_join(df_samples, lookup, by = curves_nk)
       message("  Saving bayes_samples...")
       upsert_on_conflict(conn, "madi_results", "bayes_samples", df_samples, samples_nk)
     }
 
-    # FK join for ensemble — ensemble NK doesn't include source/wavelength/etc,
-    # so we need a deduplicated lookup (one bayes_curves_id per plateid+antigen)
+    # 4. FK join for ensemble — ensemble NK doesn't include source/wavelength,
+    #    so take one curve_id per plateid+antigen combo
     if (!is.null(df_ensemble) && nrow(df_ensemble) > 0) {
       ensemble_lookup <- lookup %>%
-        dplyr::distinct(project_id, study_accession, experiment_accession,
-                        plateid, antigen, .keep_all = TRUE) %>%
-        dplyr::select(project_id, study_accession, experiment_accession,
-                      plateid, antigen, bayes_curves_id)
+        dplyr::group_by(project_id, study_accession, experiment_accession, plateid, antigen) %>%
+        dplyr::slice(1) %>%
+        dplyr::ungroup() %>%
+        dplyr::select(project_id, study_accession, experiment_accession, plateid, antigen, curve_id)
       df_ensemble <- dplyr::inner_join(
         df_ensemble, ensemble_lookup,
         by = c("project_id", "study_accession", "experiment_accession", "plateid", "antigen")
@@ -1298,22 +1307,18 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
       upsert_on_conflict(conn, "madi_results", "bayes_ensemble", df_ensemble, ensemble_nk)
     }
 
-    # Save curve_grid (delete old + insert — no NK, just FK)
+    # 5. Save curve_grid (delete old + insert — no NK, just FK via curve_id)
     if (!is.null(df_curve_grid) && nrow(df_curve_grid) > 0) {
       df_curve_grid$job_id <- job_id
-      # FK join: need bayes_curves_id per (plateid, antigen, source)
-      grid_lookup <- lookup %>%
-        dplyr::select(project_id, study_accession, experiment_accession,
-                      plateid, antigen, source, bayes_curves_id) %>%
-        dplyr::distinct()
+      grid_lookup <- dplyr::distinct(
+        lookup, project_id, study_accession, experiment_accession, plateid, antigen, source, curve_id
+      )
       df_curve_grid <- dplyr::inner_join(
         df_curve_grid, grid_lookup,
-        by = c("project_id", "study_accession", "experiment_accession",
-               "plateid", "antigen", "source")
+        by = c("project_id", "study_accession", "experiment_accession", "plateid", "antigen", "source")
       )
-      # Delete old grid rows for these plates, then insert fresh
       plateids_sql <- paste0("'", unique(df_curve_grid$plateid), "'", collapse = ",")
-      sources_sql <- paste0("'", unique(df_curve_grid$source), "'", collapse = ",")
+      sources_sql  <- paste0("'", unique(df_curve_grid$source),  "'", collapse = ",")
       DBI::dbExecute(conn, sprintf(
         "DELETE FROM madi_results.bayes_curve_grid
          WHERE project_id = %d AND study_accession = '%s'
@@ -1321,7 +1326,6 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
            AND plateid IN (%s) AND antigen = '%s' AND source IN (%s)",
         proj, study, exp_sql, plateids_sql, unique(df_curve_grid$antigen)[1], sources_sql
       ))
-      # Filter to DB columns
       db_cols <- DBI::dbGetQuery(conn,
         "SELECT column_name FROM information_schema.columns
          WHERE table_schema = 'madi_results' AND table_name = 'bayes_curve_grid'"
@@ -1337,20 +1341,18 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
       message(sprintf("  Saved %d rows into madi_results.bayes_curve_grid", nrow(df_cg)))
     }
 
-    # Save cdan_grid (delete old + insert — same pattern)
+    # 6. Save cdan_grid (delete old + insert — same pattern)
     if (!is.null(df_cdan_grid) && nrow(df_cdan_grid) > 0) {
       df_cdan_grid$job_id <- job_id
-      grid_lookup2 <- lookup %>%
-        dplyr::select(project_id, study_accession, experiment_accession,
-                      plateid, antigen, source, bayes_curves_id) %>%
-        dplyr::distinct()
+      grid_lookup2 <- dplyr::distinct(
+        lookup, project_id, study_accession, experiment_accession, plateid, antigen, source, curve_id
+      )
       df_cdan_grid <- dplyr::inner_join(
         df_cdan_grid, grid_lookup2,
-        by = c("project_id", "study_accession", "experiment_accession",
-               "plateid", "antigen", "source")
+        by = c("project_id", "study_accession", "experiment_accession", "plateid", "antigen", "source")
       )
       plateids_sql2 <- paste0("'", unique(df_cdan_grid$plateid), "'", collapse = ",")
-      sources_sql2 <- paste0("'", unique(df_cdan_grid$source), "'", collapse = ",")
+      sources_sql2  <- paste0("'", unique(df_cdan_grid$source),  "'", collapse = ",")
       DBI::dbExecute(conn, sprintf(
         "DELETE FROM madi_results.bayes_cdan_grid
          WHERE project_id = %d AND study_accession = '%s'
@@ -1374,7 +1376,7 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
     }
   }
 
-  # Save bayes_pareto_k (not FK'd to bayes_curves — NK is antigen × family)
+  # 7. Save bayes_pareto_k (not FK'd to bayes_curves — NK is antigen × family)
   if (!is.null(df_pareto_k) && nrow(df_pareto_k) > 0L) {
     df_pareto_k$job_id <- job_id
     pareto_k_nk <- c("project_id", "study_accession", "experiment_accession",
