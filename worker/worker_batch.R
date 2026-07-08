@@ -1234,8 +1234,17 @@ upsert_on_conflict <- function(conn, schema, table, df, nk_cols) {
 save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
                        df_curve_grid = NULL, df_cdan_grid = NULL,
                        df_pareto_k = NULL) {
+  # conn <- open_conn()
+  # on.exit(DBI::dbDisconnect(conn), add = TRUE)
+
   conn <- open_conn()
-  on.exit(DBI::dbDisconnect(conn), add = TRUE)
+  committed <- FALSE
+  on.exit({
+    # Roll back first (if we never reached the commit), THEN disconnect.
+    if (!committed) tryCatch(DBI::dbRollback(conn), error = function(e) NULL)
+    DBI::dbDisconnect(conn)
+  }, add = TRUE)
+  DBI::dbBegin(conn)
 
   # Add job_id (created_at is handled by DB DEFAULT NOW())
   if (!is.null(df_curves)    && nrow(df_curves) > 0)    df_curves$job_id    <- job_id
@@ -1385,9 +1394,12 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
     upsert_on_conflict(conn, "madi_results", "bayes_pareto_k", df_pareto_k, pareto_k_nk)
   }
 
+#   message("  DB save complete.")
+# }
+  DBI::dbCommit(conn)
+  committed <- TRUE
   message("  DB save complete.")
 }
-
 
 # =============================================================================
 # MAIN — Parallel antigens via mclapply, save to DB after each batch
@@ -1433,6 +1445,7 @@ message(sprintf("  Chains: %d  |  Parallel antigens: %d  |  CDAN CV: %.1f%%\n",
 write_progress(total_combos, 0L, "", "", experiments_done, experiments_total)
 
 batch_start <- Sys.time()
+save_failures <- 0L
 
 for (exp_name in experiments) {
   exp_combos <- combos[combos$experiment_accession == exp_name, ]
@@ -1482,7 +1495,11 @@ for (exp_name in experiments) {
                  df_curve_grid = result$curve_grid, df_cdan_grid = result$cdan_grid,
                  df_pareto_k = result$pareto_k)
       n_ok <- n_ok + 1L
+    # }, error = function(e) {
+    #   message(sprintf("  DB SAVE ERROR for %s: %s", combo_label, e$message))
+    # })
     }, error = function(e) {
+      save_failures <<- save_failures + 1L
       message(sprintf("  DB SAVE ERROR for %s: %s", combo_label, e$message))
     })
   }
@@ -1503,3 +1520,11 @@ write_progress(total_combos, total_combos, "", "",
 
 message(sprintf("\n==== BATCH COMPLETE — %d/%d combos in %.1f minutes ====",
                 completed_combos, total_combos, batch_elapsed))
+
+if (save_failures > 0L) {
+  message(sprintf(
+    "ERROR: %d combo(s) failed to persist to the database. Marking job as failed.",
+    save_failures
+  ))
+  quit(status = 1L)   # non-zero -> supervisor.py sets status='failed' + captures the error
+}
