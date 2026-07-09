@@ -669,23 +669,16 @@ open_conn <- function() {
 
 # ─── Combo Discovery ────────────────────────────────────────────────────────
 
-discover_combos <- function(conn, study, project_id,
-                            experiment = NULL, antigen = NULL, source_val = NULL) {
-  # One row per GROUP (fit unit) = 8-col key
-  # (project, study, experiment, nominal_sample_dilution, feature, antigen, source, wavelength)
-  # plus that group's plate count + pipe-joined plate list.
+discover_combos <- function(conn, study, project_id, experiment = NULL, antigen = NULL, source_val = NULL) {
   base_sql <- "
-    SELECT
+    SELECT DISTINCT
       h.project_id,
       s.study_accession,
       s.experiment_accession,
-      h.nominal_sample_dilution,
-      s.feature,
       s.antigen,
+      s.feature,
       s.source,
-      COALESCE(s.wavelength, '__none__')                 AS wavelength,
-      COUNT(DISTINCT h.plate)                             AS n_plate,
-      STRING_AGG(DISTINCT h.plate, '|' ORDER BY h.plate) AS plates
+      COALESCE(s.wavelength, '__none__') AS wavelength
     FROM madi_results.xmap_standard s
     INNER JOIN madi_results.xmap_header h
       ON  h.study_accession      = s.study_accession
@@ -696,50 +689,58 @@ discover_combos <- function(conn, study, project_id,
 
   params <- list(study, project_id)
   np <- 3L
+
   if (!is.null(experiment) && nzchar(experiment)) {
-    base_sql <- paste0(base_sql, sprintf("\n      AND s.experiment_accession = $%d", np))
-    params <- c(params, list(experiment)); np <- np + 1L
+    base_sql <- paste0(base_sql, sprintf(" AND s.experiment_accession = $%d", np))
+    params <- c(params, list(experiment))
+    np <- np + 1L
   }
+
   if (!is.null(antigen) && nzchar(antigen)) {
-    base_sql <- paste0(base_sql, sprintf("\n      AND s.antigen = $%d", np))
-    params <- c(params, list(antigen)); np <- np + 1L
+    base_sql <- paste0(base_sql, sprintf(" AND s.antigen = $%d", np))
+    params <- c(params, list(antigen))
+    np <- np + 1L
   }
+
   if (!is.null(source_val) && nzchar(source_val)) {
-    base_sql <- paste0(base_sql, sprintf("\n      AND s.source = $%d", np))
+    base_sql <- paste0(base_sql, sprintf(" AND s.source = $%d", np))
     params <- c(params, list(source_val))
   }
 
-  base_sql <- paste0(base_sql, "
-    GROUP BY h.project_id, s.study_accession, s.experiment_accession,
-             h.nominal_sample_dilution, s.feature, s.antigen, s.source,
-             COALESCE(s.wavelength, '__none__')
-    ORDER BY s.experiment_accession, s.antigen, s.source,
-             COALESCE(s.wavelength, '__none__'), h.nominal_sample_dilution")
-
-  combos <- DBI::dbGetQuery(conn, base_sql, params = params)
-  if (nrow(combos) > 0L) combos$plate_list <- strsplit(combos$plates, "|", fixed = TRUE)
-  combos
+  base_sql <- paste0(base_sql, " ORDER BY s.experiment_accession, s.antigen")
+  DBI::dbGetQuery(conn, base_sql, params = params)
 }
 
 
-# --- Data Fetchers (bulk: one query per project/study/experiment) ------------
+# ─── Data Fetchers ──────────────────────────────────────────────────────────
 
-fetch_standards <- function(conn, project_id, study, experiment) {
-  DBI::dbGetQuery(conn, "
+fetch_standards <- function(conn, study, experiment, antigen, wavelength, source_val = NULL) {
+  base_sql <- "
     SELECT s.antigen, h.plateid, h.plate, h.nominal_sample_dilution,
            h.sample_dilution_factor, s.antibody_mfi AS mfi,
            s.dilution AS dilution_factor, s.feature, s.source,
            COALESCE(s.wavelength, '__none__') AS wavelength, h.project_id
     FROM madi_results.xmap_standard s
     INNER JOIN madi_results.xmap_header h
-      ON  h.study_accession      = s.study_accession
+      ON h.study_accession = s.study_accession
       AND h.experiment_accession = s.experiment_accession
-      AND TRIM(h.plate_id)       = TRIM(s.plate_id)
-    WHERE h.project_id = $1 AND s.study_accession = $2 AND s.experiment_accession = $3",
-    params = list(project_id, study, experiment))
+      AND TRIM(h.plate_id) = TRIM(s.plate_id)
+    WHERE s.study_accession = $1 AND s.experiment_accession = $2 AND s.antigen = $3"
+  params <- list(study, experiment, antigen)
+  np <- 4L
+  if (wavelength != "__none__") {
+    base_sql <- paste0(base_sql, sprintf(" AND s.wavelength = $%d", np))
+    params <- c(params, list(wavelength)); np <- np + 1L
+  }
+  if (!is.null(source_val) && nzchar(source_val)) {
+    base_sql <- paste0(base_sql, sprintf(" AND s.source = $%d", np))
+    params <- c(params, list(source_val))
+  }
+  DBI::dbGetQuery(conn, base_sql, params = params)
 }
 
-fetch_samples <- function(conn, project_id, study, experiment) {
+
+fetch_samples <- function(conn, study, experiment, antigen) {
   DBI::dbGetQuery(conn, "
     SELECT s.antigen, h.plateid, h.plate, h.nominal_sample_dilution,
            s.sampleid, s.antibody_mfi AS mfi, s.dilution, s.timeperiod,
@@ -747,58 +748,39 @@ fetch_samples <- function(conn, project_id, study, experiment) {
            COALESCE(s.wavelength, '__none__') AS wavelength, h.project_id
     FROM madi_results.xmap_sample s
     INNER JOIN madi_results.xmap_header h
-      ON  h.study_accession      = s.study_accession
+      ON h.study_accession = s.study_accession
       AND h.experiment_accession = s.experiment_accession
-      AND TRIM(h.plate_id)       = TRIM(s.plate_id)
-    WHERE h.project_id = $1 AND s.study_accession = $2 AND s.experiment_accession = $3",
-    params = list(project_id, study, experiment))
+      AND TRIM(h.plate_id) = TRIM(s.plate_id)
+    WHERE s.study_accession = $1 AND s.experiment_accession = $2 AND s.antigen = $3",
+    params = list(study, experiment, antigen))
 }
 
-fetch_blanks <- function(conn, project_id, study, experiment) {
-  # NOTE: deliberately no `feature` column — blanks are background per
-  # plate/antigen, not per feature, so slice_group() must not filter them by it.
-  DBI::dbGetQuery(conn, "
-    SELECT b.antigen, b.source, COALESCE(b.wavelength, '__none__') AS wavelength,
-           h.plateid, h.plate, h.nominal_sample_dilution,
-           b.antibody_mfi AS mfi, h.project_id
+
+fetch_blanks <- function(conn, study, experiment, antigen, wavelength, source_val = NULL) {
+  base_sql <- "
+    SELECT b.antigen, h.plateid, b.antibody_mfi AS mfi
     FROM madi_results.xmap_buffer b
     INNER JOIN madi_results.xmap_header h
-      ON  h.study_accession      = b.study_accession
+      ON h.study_accession = b.study_accession
       AND h.experiment_accession = b.experiment_accession
-      AND TRIM(h.plate_id)       = TRIM(b.plate_id)
-    WHERE h.project_id = $1 AND b.study_accession = $2 AND b.experiment_accession = $3
-      AND UPPER(b.stype) = 'B' AND b.antibody_mfi > 0",
-    params = list(project_id, study, experiment))
-}
-
-# Bulk standard_curve_concentration lookup (replaces fit_one's per-antigen query).
-# Returns a named list antigen -> value (missing antigen -> NULL, not an error).
-fetch_sc_conc <- function(conn, project_id, study, experiment) {
-  res <- tryCatch(DBI::dbGetQuery(conn, "
-    SELECT DISTINCT antigen, standard_curve_concentration
-    FROM madi_results.xmap_antigen_family
-    WHERE study_accession = $1 AND experiment_accession = $2
-      AND standard_curve_concentration IS NOT NULL",
-    params = list(study, experiment)),
-    error = function(e) data.frame())
-  if (nrow(res) == 0L) return(list())
-  res <- res[!duplicated(res$antigen), , drop = FALSE]
-  stats::setNames(as.list(as.numeric(res$standard_curve_concentration)),
-                  as.character(res$antigen))
-}
-
-# Slice a bulk frame to one group, using only the group columns present in it.
-GROUP_COLS <- c("antigen", "feature", "source", "wavelength", "nominal_sample_dilution")
-slice_group <- function(df, grp) {
-  if (is.null(df) || nrow(df) == 0L) return(df[0, , drop = FALSE])
-  keys <- intersect(GROUP_COLS, names(df))
-  keep <- rep(TRUE, nrow(df))
-  for (k in keys) keep <- keep & (as.character(df[[k]]) == as.character(grp[[k]][1]))
-  df[keep, , drop = FALSE]
+      AND TRIM(h.plate_id) = TRIM(b.plate_id)
+    WHERE b.study_accession = $1 AND b.experiment_accession = $2 AND b.antigen = $3
+      AND UPPER(b.stype) = 'B' AND b.antibody_mfi > 0"
+  params <- list(study, experiment, antigen)
+  np <- 4L
+  if (wavelength != "__none__") {
+    base_sql <- paste0(base_sql, sprintf(" AND b.wavelength = $%d", np))
+    params <- c(params, list(wavelength)); np <- np + 1L
+  }
+  if (!is.null(source_val) && nzchar(source_val)) {
+    base_sql <- paste0(base_sql, sprintf(" AND b.source = $%d", np))
+    params <- c(params, list(source_val))
+  }
+  DBI::dbGetQuery(conn, base_sql, params = params)
 }
 
 
-# --- Helpers ---
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 safe_get <- function(lst, key) {
   if (is.null(lst) || is.null(lst[[key]]) || length(lst[[key]]) == 0) return(NA_real_)
@@ -865,28 +847,29 @@ find_loq_custom <- function(cdan_result, threshold) {
 
 # ─── Fit One Antigen Combo ──────────────────────────────────────────────────
 
-fit_one <- function(grp, stds_raw, samps_raw, blanks_raw,
-                    sc_conc = NULL, cdan_cv = 20) {
+fit_one <- function(conn, study, experiment, antigen,
+                    feature, source_val, wavelength, project_id,
+                    cdan_cv = 20) {
 
-  # Group identity (the 8-column "group of plates" fit unit)
-  study                   <- as.character(grp$study_accession)
-  experiment              <- as.character(grp$experiment_accession)
-  antigen                 <- as.character(grp$antigen)
-  feature                 <- as.character(grp$feature)
-  source_val              <- as.character(grp$source)
-  wavelength              <- as.character(grp$wavelength)
-  project_id              <- grp$project_id[1]
-  nominal_sample_dilution <- as.character(grp$nominal_sample_dilution)
+  message(sprintf("  Fitting %s | %s | %s", study, experiment, antigen))
 
-  message(sprintf("  Fitting %s | %s | %s | feat=%s src=%s wl=%s nom=%s (%s plate(s))",
-                  study, experiment, antigen, feature, source_val, wavelength,
-                  nominal_sample_dilution, as.character(grp$n_plate %||% NA)))
+  stds_raw <- fetch_standards(conn, study, experiment, antigen, wavelength, source_val)
+  if (nrow(stds_raw) == 0L) { message("  SKIP: no standards"); return(NULL) }
+  samps_raw  <- fetch_samples(conn, study, experiment, antigen)
+  blanks_raw <- fetch_blanks(conn, study, experiment, antigen, wavelength, source_val)
 
-  # Data is PRE-SLICED to this group by the caller — no DB calls here.
-  if (is.null(stds_raw) || nrow(stds_raw) == 0L) { message("  SKIP: no standards"); return(NULL) }
-
-  # sc_conc (standard_curve_concentration) is passed in from a bulk
-  # per-experiment lookup, replacing the old per-antigen query.
+  # Look up standard_curve_concentration from xmap_antigen_family
+  # This is the undiluted concentration (e.g. 10000 for tt), used as the numerator
+  # in concentration = base_num / dilution_factor (same as i-spi std_curver_ui.R line 2620)
+  sc_conc <- tryCatch({
+    res <- DBI::dbGetQuery(conn, sprintf(
+      "SELECT DISTINCT standard_curve_concentration
+       FROM madi_results.xmap_antigen_family
+       WHERE study_accession = '%s' AND experiment_accession = '%s' AND antigen = '%s'
+         AND standard_curve_concentration IS NOT NULL
+       LIMIT 1", study, experiment, antigen))
+    if (nrow(res) > 0) as.numeric(res$standard_curve_concentration[1]) else NULL
+  }, error = function(e) NULL)
 
   stds <- stds_raw |>
     mutate(plateid = as.character(plateid), mfi = as.numeric(mfi),
@@ -1198,31 +1181,6 @@ fit_one <- function(grp, stds_raw, samps_raw, blanks_raw,
   df_curve_grid <- if (length(curve_grid_rows) > 0) do.call(rbind, curve_grid_rows) else data.frame()
   df_cdan_grid  <- if (length(cdan_grid_rows) > 0) do.call(rbind, cdan_grid_rows) else data.frame()
 
-  # Stamp the full curve natural key onto every per-plate child so save_to_db
-  # resolves curve_id on the COMPLETE key. Group fields are constant for this
-  # fit; plate + nominal come from plate_meta by plateid (1:1 within a group).
-  plate_nk <- dplyr::distinct(plate_meta[, c("plateid", "plate", "nominal_sample_dilution")])
-  stamp_curve_nk <- function(df) {
-    if (is.null(df) || nrow(df) == 0L) return(df)
-    df$feature    <- feature
-    df$source     <- source_val
-    df$wavelength <- wavelength
-    df <- df[, setdiff(names(df), c("plate", "nominal_sample_dilution")), drop = FALSE]
-    dplyr::left_join(df, plate_nk, by = "plateid")
-  }
-  stamp_group_key <- function(df) {
-    if (is.null(df) || nrow(df) == 0L) return(df)
-    df$nominal_sample_dilution <- nominal_sample_dilution
-    df$feature    <- feature
-    df$source     <- source_val
-    df$wavelength <- wavelength
-    df
-  }
-  df_ensemble_local <- stamp_curve_nk(df_ensemble_local)
-  df_curve_grid     <- stamp_curve_nk(df_curve_grid)
-  df_cdan_grid      <- stamp_curve_nk(df_cdan_grid)
-  pareto_k_df       <- stamp_group_key(pareto_k_df)
-
   message(sprintf("  Done: %d curves, %d samples, %d ensemble, %d plots, %d curve_grid, %d cdan_grid",
                   nrow(df_curves_local), nrow(df_samples_local) %||% 0L,
                   nrow(df_ensemble_local), length(plots_local),
@@ -1296,6 +1254,9 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
   curves_nk   <- c("project_id", "study_accession", "experiment_accession",
                     "plateid", "plate", "nominal_sample_dilution",
                     "source", "wavelength", "antigen", "feature")
+  samples_nk  <- c(curves_nk, "patientid", "timeperiod", "sampleid", "dilution")
+  ensemble_nk <- c("project_id", "study_accession", "experiment_accession",
+                    "plateid", "antigen", "family")
 
   if (!is.null(df_curves) && nrow(df_curves) > 0) {
     proj    <- unique(df_curves$project_id)[1]
@@ -1332,84 +1293,105 @@ save_to_db <- function(df_curves, df_samples, df_ensemble, job_id,
     message("  Saving bayes_curves...")
     upsert_on_conflict(conn, "madi_results", "bayes_curves", df_curves, c("curve_id"))
 
-    # Resolve curve_id on the FULL natural key; fail loud if any row misses.
-    resolve_cid <- function(df, what) {
-      if (is.null(df) || nrow(df) == 0L) return(NULL)
-      have   <- intersect(curves_nk, names(df))
-      before <- nrow(df)
-      out <- dplyr::inner_join(df, lookup[, c("curve_id", curves_nk)], by = have)
-      if (nrow(out) != before) {
-        stop(sprintf("%s: curve_id resolution changed rows %d -> %d (NK used: %s)",
-                     what, before, nrow(out), paste(have, collapse = ", ")))
-      }
-      out
-    }
-    # Replace all rows for these curve_ids, then insert (cols filtered to table).
-    replace_by_curve_id <- function(table, df) {
-      if (is.null(df) || nrow(df) == 0L) return(invisible())
-      db_cols <- DBI::dbGetQuery(conn, sprintf(
-        "SELECT column_name FROM information_schema.columns
-         WHERE table_schema = 'madi_results' AND table_name = '%s'", table))$column_name
-      if ("job_id" %in% db_cols) df$job_id <- job_id
-      dfw <- df[, names(df) %in% db_cols, drop = FALSE]
-      ids <- paste(unique(df$curve_id), collapse = ",")
-      DBI::dbExecute(conn, sprintf(
-        "DELETE FROM madi_results.%s WHERE curve_id IN (%s)", table, ids))
-      tmp <- paste0("tmp_", table)
-      DBI::dbWriteTable(conn, tmp, dfw, overwrite = TRUE, row.names = FALSE)
-      cl <- paste(sprintf('"%s"', names(dfw)), collapse = ", ")
-      n <- DBI::dbExecute(conn, sprintf(
-        "INSERT INTO madi_results.%s (%s) SELECT %s FROM %s", table, cl, cl, tmp))
-      DBI::dbRemoveTable(conn, tmp)
-      message(sprintf("  Saved %d rows into madi_results.%s", n, table))
+    # 3. FK join for samples — stamp curve_id, then upsert
+    if (!is.null(df_samples) && nrow(df_samples) > 0) {
+      df_samples <- dplyr::inner_join(df_samples, lookup, by = curves_nk)
+      message("  Saving bayes_samples...")
+      upsert_on_conflict(conn, "madi_results", "bayes_samples", df_samples, samples_nk)
     }
 
-    # 3. bayes_samples
-    if (!is.null(df_samples) && nrow(df_samples) > 0) {
-      message("  Saving bayes_samples...")
-      replace_by_curve_id("bayes_samples", resolve_cid(df_samples, "samples"))
-    }
-    # 4. bayes_ensemble (one row per curve_id x family)
+    # 4. FK join for ensemble — ensemble NK doesn't include source/wavelength,
+    #    so take one curve_id per plateid+antigen combo
     if (!is.null(df_ensemble) && nrow(df_ensemble) > 0) {
+      ensemble_lookup <- lookup %>%
+        dplyr::group_by(project_id, study_accession, experiment_accession, plateid, antigen) %>%
+        dplyr::slice(1) %>%
+        dplyr::ungroup() %>%
+        dplyr::select(project_id, study_accession, experiment_accession, plateid, antigen, curve_id)
+      df_ensemble <- dplyr::inner_join(
+        df_ensemble, ensemble_lookup,
+        by = c("project_id", "study_accession", "experiment_accession", "plateid", "antigen")
+      )
       message("  Saving bayes_ensemble...")
-      replace_by_curve_id("bayes_ensemble", resolve_cid(df_ensemble, "ensemble"))
+      upsert_on_conflict(conn, "madi_results", "bayes_ensemble", df_ensemble, ensemble_nk)
     }
-    # 5. bayes_curve_grid
+
+    # 5. Save curve_grid (delete old + insert — no NK, just FK via curve_id)
     if (!is.null(df_curve_grid) && nrow(df_curve_grid) > 0) {
-      message("  Saving bayes_curve_grid...")
-      replace_by_curve_id("bayes_curve_grid", resolve_cid(df_curve_grid, "curve_grid"))
+      df_curve_grid$job_id <- job_id
+      grid_lookup <- dplyr::distinct(
+        lookup, project_id, study_accession, experiment_accession, plateid, antigen, source, curve_id
+      )
+      df_curve_grid <- dplyr::inner_join(
+        df_curve_grid, grid_lookup,
+        by = c("project_id", "study_accession", "experiment_accession", "plateid", "antigen", "source")
+      )
+      plateids_sql <- paste0("'", unique(df_curve_grid$plateid), "'", collapse = ",")
+      sources_sql  <- paste0("'", unique(df_curve_grid$source),  "'", collapse = ",")
+      DBI::dbExecute(conn, sprintf(
+        "DELETE FROM madi_results.bayes_curve_grid
+         WHERE project_id = %d AND study_accession = '%s'
+           AND experiment_accession IN (%s)
+           AND plateid IN (%s) AND antigen = '%s' AND source IN (%s)",
+        proj, study, exp_sql, plateids_sql, unique(df_curve_grid$antigen)[1], sources_sql
+      ))
+      db_cols <- DBI::dbGetQuery(conn,
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'madi_results' AND table_name = 'bayes_curve_grid'"
+      )$column_name
+      df_cg <- df_curve_grid[, names(df_curve_grid) %in% db_cols, drop = FALSE]
+      DBI::dbWriteTable(conn, "tmp_bayes_curve_grid", df_cg, overwrite = TRUE, row.names = FALSE)
+      col_list <- paste(sprintf('"%s"', names(df_cg)), collapse = ", ")
+      DBI::dbExecute(conn, sprintf(
+        "INSERT INTO madi_results.bayes_curve_grid (%s) SELECT %s FROM tmp_bayes_curve_grid",
+        col_list, col_list
+      ))
+      DBI::dbRemoveTable(conn, "tmp_bayes_curve_grid")
+      message(sprintf("  Saved %d rows into madi_results.bayes_curve_grid", nrow(df_cg)))
     }
-    # 6. bayes_cdan_grid
+
+    # 6. Save cdan_grid (delete old + insert — same pattern)
     if (!is.null(df_cdan_grid) && nrow(df_cdan_grid) > 0) {
-      message("  Saving bayes_cdan_grid...")
-      replace_by_curve_id("bayes_cdan_grid", resolve_cid(df_cdan_grid, "cdan_grid"))
+      df_cdan_grid$job_id <- job_id
+      grid_lookup2 <- dplyr::distinct(
+        lookup, project_id, study_accession, experiment_accession, plateid, antigen, source, curve_id
+      )
+      df_cdan_grid <- dplyr::inner_join(
+        df_cdan_grid, grid_lookup2,
+        by = c("project_id", "study_accession", "experiment_accession", "plateid", "antigen", "source")
+      )
+      plateids_sql2 <- paste0("'", unique(df_cdan_grid$plateid), "'", collapse = ",")
+      sources_sql2  <- paste0("'", unique(df_cdan_grid$source),  "'", collapse = ",")
+      DBI::dbExecute(conn, sprintf(
+        "DELETE FROM madi_results.bayes_cdan_grid
+         WHERE project_id = %d AND study_accession = '%s'
+           AND experiment_accession IN (%s)
+           AND plateid IN (%s) AND antigen = '%s' AND source IN (%s)",
+        proj, study, exp_sql, plateids_sql2, unique(df_cdan_grid$antigen)[1], sources_sql2
+      ))
+      db_cols2 <- DBI::dbGetQuery(conn,
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'madi_results' AND table_name = 'bayes_cdan_grid'"
+      )$column_name
+      df_cd <- df_cdan_grid[, names(df_cdan_grid) %in% db_cols2, drop = FALSE]
+      DBI::dbWriteTable(conn, "tmp_bayes_cdan_grid", df_cd, overwrite = TRUE, row.names = FALSE)
+      col_list2 <- paste(sprintf('"%s"', names(df_cd)), collapse = ", ")
+      DBI::dbExecute(conn, sprintf(
+        "INSERT INTO madi_results.bayes_cdan_grid (%s) SELECT %s FROM tmp_bayes_cdan_grid",
+        col_list2, col_list2
+      ))
+      DBI::dbRemoveTable(conn, "tmp_bayes_cdan_grid")
+      message(sprintf("  Saved %d rows into madi_results.bayes_cdan_grid", nrow(df_cd)))
     }
   }
 
-  # 7. bayes_pareto_k — fit-level: keyed by the 8-col group key + family
+  # 7. Save bayes_pareto_k (not FK'd to bayes_curves — NK is antigen × family)
   if (!is.null(df_pareto_k) && nrow(df_pareto_k) > 0L) {
-    message("  Saving bayes_pareto_k...")
-    esc <- function(x) gsub("'", "''", as.character(x))
-    g <- df_pareto_k[1, ]
-    DBI::dbExecute(conn, sprintf(
-      "DELETE FROM madi_results.bayes_pareto_k
-        WHERE project_id = %d AND study_accession = '%s' AND experiment_accession = '%s'
-          AND nominal_sample_dilution = '%s' AND feature = '%s' AND antigen = '%s'
-          AND source = '%s' AND wavelength = '%s'",
-      as.integer(g$project_id), esc(g$study_accession), esc(g$experiment_accession),
-      esc(g$nominal_sample_dilution), esc(g$feature), esc(g$antigen),
-      esc(g$source), esc(g$wavelength)))
-    db_cols <- DBI::dbGetQuery(conn,
-      "SELECT column_name FROM information_schema.columns
-        WHERE table_schema = 'madi_results' AND table_name = 'bayes_pareto_k'")$column_name
     df_pareto_k$job_id <- job_id
-    dfw <- df_pareto_k[, names(df_pareto_k) %in% db_cols, drop = FALSE]
-    DBI::dbWriteTable(conn, "tmp_bayes_pareto_k", dfw, overwrite = TRUE, row.names = FALSE)
-    cl <- paste(sprintf('"%s"', names(dfw)), collapse = ", ")
-    n <- DBI::dbExecute(conn, sprintf(
-      "INSERT INTO madi_results.bayes_pareto_k (%s) SELECT %s FROM tmp_bayes_pareto_k", cl, cl))
-    DBI::dbRemoveTable(conn, "tmp_bayes_pareto_k")
-    message(sprintf("  Saved %d rows into madi_results.bayes_pareto_k", n))
+    pareto_k_nk <- c("project_id", "study_accession", "experiment_accession",
+                      "antigen", "family")
+    message("  Saving bayes_pareto_k...")
+    upsert_on_conflict(conn, "madi_results", "bayes_pareto_k", df_pareto_k, pareto_k_nk)
   }
 
 #   message("  DB save complete.")
@@ -1475,50 +1457,26 @@ for (exp_name in experiments) {
   write_progress(total_combos, completed_combos, exp_name, antigen_labels,
                  experiments_done, experiments_total)
 
-  # Bulk-load this experiment ONCE (parent process); mclapply workers slice
-  # it in memory via copy-on-write — no per-group DB calls.
-  conn_bulk   <- open_conn()
-  std_all     <- fetch_standards(conn_bulk, PARAMS$project_id, PARAMS$study, exp_name)
-  samp_all    <- fetch_samples(conn_bulk,   PARAMS$project_id, PARAMS$study, exp_name)
-  blank_all   <- fetch_blanks(conn_bulk,    PARAMS$project_id, PARAMS$study, exp_name)
-  sc_conc_map <- fetch_sc_conc(conn_bulk,   PARAMS$project_id, PARAMS$study, exp_name)
-  DBI::dbDisconnect(conn_bulk)
-  message(sprintf("  Loaded %d std / %d sample / %d blank rows for %s",
-                  nrow(std_all), nrow(samp_all), nrow(blank_all), exp_name))
-
-  # Integrity: a plate_id should map to a single (plate, nominal_sample_dilution).
-  dupe <- std_all |>
-    dplyr::distinct(plateid, plate, nominal_sample_dilution) |>
-    dplyr::add_count(plateid) |>
-    dplyr::filter(n > 1L)
-  if (nrow(dupe) > 0L) {
-    message(sprintf("  WARNING: %d plate_id(s) map to multiple (plate, nominal_sample_dilution): %s",
-                    dplyr::n_distinct(dupe$plateid),
-                    paste(utils::head(unique(dupe$plateid), 5), collapse = ", ")))
-  }
-
-  # Run groups in parallel; each worker slices the bulk frames to its group.
+  # Run antigens in parallel via mclapply (same as hpc_bayes_batch.R)
   t0 <- Sys.time()
   results_list <- mclapply(seq_len(n_ag), function(i) {
-    grp <- exp_combos[i, ]
+    r <- exp_combos[i, ]
+    conn_local <- open_conn()
+    on.exit(DBI::dbDisconnect(conn_local))
     t_start <- Sys.time()
     result <- tryCatch(
-      fit_one(grp,
-              slice_group(std_all,   grp),
-              slice_group(samp_all,  grp),
-              slice_group(blank_all, grp),
-              sc_conc = sc_conc_map[[as.character(grp$antigen)]],
+      fit_one(conn_local, r$study_accession, r$experiment_accession, r$antigen,
+              r$feature, r$source, r$wavelength, r$project_id,
               cdan_cv = PARAMS$cdan_cv),
       error = function(e) { message("  FATAL: ", e$message); NULL }
     )
     el <- as.numeric(difftime(Sys.time(), t_start, units = "secs"))
     if (!is.null(result)) {
-      message(sprintf("  OK %s | %s [nom=%s] %.1fs (%d curves, %d samples)",
-                      exp_name, grp$antigen, grp$nominal_sample_dilution, el,
+      message(sprintf("  OK %s | %s %.1fs (%d curves, %d samples)",
+                      exp_name, r$antigen, el,
                       nrow(result$curves), nrow(result$samples) %||% 0L))
     } else {
-      message(sprintf("  FAIL %s | %s [nom=%s] %.1fs",
-                      exp_name, grp$antigen, grp$nominal_sample_dilution, el))
+      message(sprintf("  FAIL %s | %s %.1fs", exp_name, r$antigen, el))
     }
     result
   }, mc.cores = N_PARALLEL_ANTIGENS)
@@ -1530,7 +1488,7 @@ for (exp_name in experiments) {
     result <- results_list[[i]]
     if (is.null(result)) next
     r <- exp_combos[i, ]
-    combo_label <- sprintf("%s | %s [nom=%s]", exp_name, r$antigen, r$nominal_sample_dilution)
+    combo_label <- sprintf("%s | %s", exp_name, r$antigen)
     tryCatch({
       message(sprintf("  Saving %s to DB...", combo_label))
       save_to_db(result$curves, result$samples, result$ensemble, PARAMS$job_id,
